@@ -16,7 +16,7 @@ Or download [`ohmybug.mjs`](ohmybug.mjs) and run it with `node ohmybug.mjs`. The
 curl -fsSL https://raw.githubusercontent.com/explyt/ohmybug-cli/main/install.sh | OHMYBUG_CLI_URL=https://raw.githubusercontent.com/explyt/ohmybug-cli/v0.1.0/ohmybug.mjs sh
 ```
 
-Behind a proxy: Node's `fetch` reads `HTTPS_PROXY` only on Node 24 or newer with `NODE_USE_ENV_PROXY=1`.
+Behind a proxy: Node's `fetch` reads `HTTPS_PROXY` only with `NODE_USE_ENV_PROXY=1` (Node 22.21 or newer, or 24 or newer).
 
 ## Use
 
@@ -25,7 +25,7 @@ Create an API key at [ohmybug.ai/me](https://ohmybug.ai/me) and put it in `OHMYB
 ```sh
 ohmybug                  # review <base>...HEAD: the commits of this branch
 ohmybug --base develop   # the same against another base
-ohmybug --uncommitted    # review the working tree against HEAD, untracked files included
+ohmybug --uncommitted    # review the working tree against HEAD, untracked files included (not ignored ones)
 ```
 
 The base is `--base`, else `$CI_MERGE_REQUEST_TARGET_BRANCH_NAME` (GitLab merge request pipelines), else `origin/main`. The CI clone must contain the base: fetch it, or clone with enough depth.
@@ -41,7 +41,7 @@ The CLI prints each finding (severity, file:line, title, failure scenario) and a
 | Variable | Default | |
 |---|---|---|
 | `OHMYBUG_API_KEY` | required | your key |
-| `OHMYBUG_TIMEOUT_S` | `1800` | how long to wait for the review |
+| `OHMYBUG_TIMEOUT_S` | `1800` | how long to wait for the review, 30 to 86400 seconds |
 | `OHMYBUG_URL` | `https://mcp.ohmybug.ai` | the service |
 
 ## Billing
@@ -85,7 +85,7 @@ pipelines:
 
 ## What is sent
 
-The diff, the list of file paths at the reviewed head, and up to 29 related files (the changed files, the project manifests, and files that mention a changed module). During the review the reviewers may ask for more files by path. Every file sent is one of the repository's tracked files, read from the reviewed commit; with `--uncommitted`, from the working tree, untracked files included. Ignored files, anything under `.git` and anything outside the repository are never sent. With the review go the branch name and, in a GitLab merge request pipeline, the merge request title and description.
+The diff (when it is over 2 MiB, per-file entries over 160 KiB, such as lockfiles and generated files, are left out and the run says so), the list of file paths at the reviewed head, and up to 29 related files (the changed files, the project manifests, and files that mention a changed module). During the review the reviewers may ask for more files by path. Every file sent is read from the reviewed commit; with `--uncommitted`, from a snapshot of the working tree taken at the start (untracked files included, nested repositories left out), so edits made while the review runs do not reach it. Ignored files, anything under `.git` and anything outside the repository are never sent. With the review go the branch name and, in a GitLab merge request pipeline, the merge request title and description.
 
 ## Develop
 

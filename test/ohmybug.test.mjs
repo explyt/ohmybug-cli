@@ -28,32 +28,38 @@ function repo() {
  * A review server that answers submit_review, wait_review and get_findings with `findings` and `status`. `requested`
  * makes the first wait_review a file request whose answer lands in `posted`; `sse` answers as an event stream;
  * `submitStatus` fails submit_review with that HTTP status; `toolError` answers every tool call with isError;
- * `faults` fails the first call of a tool: { wait_review: 503 | "reset" | "garble" }.
+ * `faults` fails the first call of a tool: { wait_review: 503 | "reset" | "garble" | "internal" | "rate_limited" };
+ * `filesStatus` answers the file upload with that status; `filesUrl` replaces the file request's address.
  */
-async function server({ findings = [], status = "done", review_of_record = true, httpStatus = 200, requested, sse = false, submitStatus, toolError, faults = {} } = {}) {
+async function server({ findings = [], status = "done", review_of_record = true, httpStatus = 200, requested, sse = false, submitStatus, toolError, faults = {}, filesStatus = 200, filesUrl } = {}) {
   const calls = [], posted = [];
-  let url;
+  let url, askedOnce = false;
   const srv = createServer((req, res) => {
     let body = "";
     req.on("data", (c) => (body += c));
     req.on("end", () => {
       if (httpStatus !== 200) { res.writeHead(httpStatus); return res.end("no"); }
-      if (req.url === "/files") { posted.push(JSON.parse(body)); res.writeHead(200); return res.end("{}"); }
+      if (req.url === "/files") { posted.push(JSON.parse(body)); res.writeHead(filesStatus); return res.end("{}"); }
       const msg = JSON.parse(body);
       const { name, arguments: args } = msg.params;
       calls.push({ name, args, auth: req.headers.authorization });
       if (name === "submit_review" && submitStatus) { res.writeHead(submitStatus); return res.end("boom"); }
-      const fault = faults[name];
+      let fault = faults[name];
       if (fault) {
         delete faults[name];
+        if (fault === "internal" || fault === "rate_limited") {
+          res.writeHead(200, { "content-type": "application/json" });
+          return res.end(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { isError: true, content: [{ type: "text", text: JSON.stringify({ error: fault, message: "blip" }) }] } }));
+        }
         if (fault === "reset") return req.socket.destroy();
         if (fault === "garble") { res.writeHead(200, { "content-type": "application/json" }); return res.end("{\"jsonrpc\":"); }
         res.writeHead(fault); return res.end("busy");
       }
-      const asked = name === "wait_review" && requested && !posted.length;
+      const asked = name === "wait_review" && requested && !askedOnce;
+      if (asked) askedOnce = true;
       const result = toolError ? toolError
         : name === "submit_review" ? { review_id: "rev_test", status: "running" }
-        : asked ? { review_id: "rev_test", status: "needs_files", requested_files: requested, files_url: `${url}/files` }
+        : asked ? { review_id: "rev_test", status: "needs_files", requested_files: requested, files_url: filesUrl ?? `${url}/files` }
         : name === "wait_review" ? { review_id: "rev_test", status }
         : { review_id: "rev_test", status, findings, review_of_record, live_url: "https://example.test/live/x" };
       const answer = JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { content: [{ type: "text", text: JSON.stringify(result) }], ...(toolError ? { isError: true } : {}) } });
@@ -68,7 +74,7 @@ async function server({ findings = [], status = "done", review_of_record = true,
 
 async function cli(dir, argv, env) {
   const out = [], log = [];
-  const code = await run({ argv, env: { OHMYBUG_API_KEY: "test-key", OHMYBUG_TIMEOUT_S: "20", ...env }, cwd: dir, out: (s) => out.push(s), log: (s) => log.push(s) });
+  const code = await run({ argv, env: { OHMYBUG_API_KEY: "test-key", OHMYBUG_TIMEOUT_S: "60", ...env }, cwd: dir, out: (s) => out.push(s), log: (s) => log.push(s) });
   return { code, out: out.join("\n"), log: log.join("\n") };
 }
 
@@ -103,16 +109,22 @@ test("exit codes: 1 on a medium or worse bug, 0 on lows or none, 2 on a failed o
     assert.equal(exitCodeFor({ status: "done", findings: [{ ...low, severity }] }), 1, severity);
   }
   assert.equal(exitCodeFor({ status: "done", findings: [{ ...low, severity: "P3" }] }), 0);
-  // A design-level bug with no file still blocks.
+  // A design-level bug with no file still blocks; a severity the gate does not know, or none, blocks.
   assert.equal(exitCodeFor({ status: "done", findings: [{ severity: "high", title: "no file" }] }), 1);
+  assert.equal(exitCodeFor({ status: "done", findings: [{ ...low, severity: "blocker" }] }), 1);
+  assert.equal(exitCodeFor({ status: "done", findings: [{ title: "unrated" }] }), 1);
+  // Lows from a cut-short run do not make it clean.
+  assert.equal(exitCodeFor({ status: "done", findings: [low], review_of_record: false }), 2);
 });
 
-test("parseArgs: an empty --base= is refused; OHMYBUG_TIMEOUT_S must be a number", async () => {
+test("parseArgs: an empty --base= is refused; OHMYBUG_TIMEOUT_S must be whole seconds from 30 to 86400", async () => {
   assert.equal(typeof parseArgs(["--base="]), "string");
   const { dir } = repo();
-  const r = await cli(dir, [], { OHMYBUG_TIMEOUT_S: "30m" });
-  assert.equal(r.code, 2);
-  assert.match(r.log, /OHMYBUG_TIMEOUT_S must be a number/);
+  for (const t of ["30m", "600.5", "15", "100000"]) {
+    const r = await cli(dir, [], { OHMYBUG_TIMEOUT_S: t });
+    assert.equal(r.code, 2, t);
+    assert.match(r.log, /OHMYBUG_TIMEOUT_S must be whole seconds/);
+  }
 });
 
 test("ciMeta: an empty CI variable falls back to the next one", () => {
@@ -319,18 +331,17 @@ test("could not run: no key, a refused key, a failed review, a base the clone la
   }
 });
 
-test("--uncommitted follows a symlink only to another file of the change, never to an ignored or outside file", async () => {
+test("--uncommitted sends a symlink as its target's name, never the target's content", async () => {
   const { dir } = repo();
   writeFileSync(join(dir, ".gitignore"), ".env\n");
   writeFileSync(join(dir, ".env"), "SECRET=1\n");
   writeFileSync(join(dir, "app.js"), "export const a = 13\n");
   symlinkSync(".env", join(dir, "cfg"));
   symlinkSync("/etc/hosts", join(dir, "out"));
-  symlinkSync("app.js", join(dir, "ok"));
-  const s = await server({ requested: ["cfg", "out", "ok"] });
+  const s = await server({ requested: ["cfg", "out", ".env"] });
   try {
     assert.equal((await cli(dir, ["--uncommitted"], { OHMYBUG_URL: s.url })).code, 0);
-    assert.deepEqual(s.posted[0].files, [{ path: "ok", content: "export const a = 13\n" }]);
+    assert.deepEqual(s.posted[0].files, [{ path: "cfg", content: ".env" }, { path: "out", content: "/etc/hosts" }]);
   } finally { await s.close() }
 });
 
@@ -340,6 +351,9 @@ test("submit_review: a 429 is sent again and starts one hunt; a reset or an inte
   git("commit", "-qam", "c");
   for (const [opts, code, submits] of [
     [{ faults: { submit_review: 429 } }, 0, 2],
+    [{ faults: { submit_review: "rate_limited" } }, 0, 2],
+    [{ faults: { submit_review: "garble" } }, 2, 1],
+    [{ submitStatus: 502 }, 2, 1],
     [{ faults: { submit_review: "reset" } }, 2, 1],
     [{ toolError: { error: "internal", message: "late failure" } }, 2, 1],
   ]) {
@@ -349,16 +363,16 @@ test("submit_review: a 429 is sent again and starts one hunt; a reset or an inte
       assert.equal(r.code, code, JSON.stringify(opts) + r.log);
       assert.equal(s.calls.filter((c) => c.name === "submit_review").length, submits, JSON.stringify(opts));
       // The server counts what it received: one hunt, however many attempts reached it.
-      if (code === 2) assert.match(r.log, /not sent again|late failure/);
+      if (code === 2) assert.match(r.log, /A hunt may have started|late failure/);
     } finally { await s.close() }
   }
 });
 
-test("polling outlives a 5xx, a reset and a garbled answer", async () => {
+test("polling outlives a 5xx, a reset, a garbled answer and a transient tool error", async () => {
   const { dir, git } = repo();
   writeFileSync(join(dir, "app.js"), "export const a = 15\n");
   git("commit", "-qam", "c");
-  for (const fault of [503, "reset", "garble"]) {
+  for (const fault of [503, "reset", "garble", "internal", "rate_limited"]) {
     const s = await server({ findings: [high], faults: { wait_review: fault } });
     try { assert.equal((await cli(dir, [], { OHMYBUG_URL: s.url, OHMYBUG_TIMEOUT_S: "60" })).code, 1, String(fault)); } finally { await s.close() }
   }
@@ -370,28 +384,40 @@ test("a review still running at OHMYBUG_TIMEOUT_S exits 2 and names the review",
   git("commit", "-qam", "c");
   const s = await server({ status: "running" });
   try {
-    const r = await cli(dir, [], { OHMYBUG_URL: s.url, OHMYBUG_TIMEOUT_S: "17" });
+    const r = await cli(dir, [], { OHMYBUG_URL: s.url, OHMYBUG_TIMEOUT_S: "30" });
     assert.equal(r.code, 2);
     assert.match(r.log, /no result within OHMYBUG_TIMEOUT_S/);
     assert.match(r.log, /review rev_test may still be running/);
   } finally { await s.close() }
 });
 
-test("--uncommitted: a nested repository is skipped, a 200 KiB untracked file is reviewed, skipped-only changes exit 2", async () => {
-  const { dir } = repo();
+test("--uncommitted: a nested repository is left out and the user's index is untouched", async () => {
+  const { dir, git } = repo();
   mkdirSync(join(dir, "sub"));
   execFileSync("git", ["-C", join(dir, "sub"), "init", "-q"]);
   writeFileSync(join(dir, "sub", "x.js"), "1\n");
-  const only = await cli(dir, ["--uncommitted"], { OHMYBUG_URL: "http://127.0.0.1:9" });
-  assert.equal(only.code, 2);
-  assert.match(only.log, /only changes are untracked paths/);
-  writeFileSync(join(dir, "big.js"), `export const big = "${"y".repeat(200 * 1024)}"\n`);
-  const s = await server();
+  writeFileSync(join(dir, "new.js"), "export const n = 3\n");
+  const status = git("status", "--porcelain");
+  const s = await server({ requested: ["new.js", "sub/x.js"] });
   try {
     const r = await cli(dir, ["--uncommitted"], { OHMYBUG_URL: s.url });
-    assert.equal(r.code, 0);
-    assert.match(s.calls.find((c) => c.name === "submit_review").args.diff, /\+export const big/);
-    assert.match(r.log, /left out 1 untracked path/);
+    assert.equal(r.code, 0, r.log);
+    const diff = s.calls.find((c) => c.name === "submit_review").args.diff;
+    assert.match(diff, /\+export const n = 3/);
+    assert.doesNotMatch(diff, /sub/);
+    assert.deepEqual(s.posted[0].files, [{ path: "new.js", content: "export const n = 3\n" }]);
+    assert.equal(git("status", "--porcelain"), status);
+  } finally { await s.close() }
+});
+
+test("--uncommitted in a repository with no commit reviews every file against the empty tree", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ohmybug-cli-"));
+  execFileSync("git", ["-C", dir, "init", "-q"]);
+  writeFileSync(join(dir, "first.js"), "export const f = 1\n");
+  const s = await server();
+  try {
+    assert.equal((await cli(dir, ["--uncommitted"], { OHMYBUG_URL: s.url })).code, 0);
+    assert.match(s.calls.find((c) => c.name === "submit_review").args.diff, /\+export const f = 1/);
   } finally { await s.close() }
 });
 
@@ -401,4 +427,37 @@ test("fitBody drops context files from the end until the escaped JSON fits, neve
   assert.deepEqual(fitBody(body, 2500).files.map((f) => f.path), ["tree", "a"]);
   assert.deepEqual(fitBody(body, 10).files.map((f) => f.path), ["tree"]);
   assert.equal(fitBody(body, 1e6).files.length, 3);
+});
+
+test("a refused file answer does not stop the review; a file request to another host is not answered", async () => {
+  const { dir, git } = repo();
+  writeFileSync(join(dir, "app.js"), "export const a = 17\n");
+  git("commit", "-qam", "c");
+  const refused = await server({ requested: ["app.js"], filesStatus: 413, findings: [high] });
+  try {
+    const r = await cli(dir, [], { OHMYBUG_URL: refused.url });
+    assert.equal(r.code, 1);
+    assert.match(r.log, /the file answer was refused \(HTTP 413/);
+  } finally { await refused.close() }
+  const elsewhere = await server({ requested: ["app.js"], filesUrl: "http://169.254.169.254/files" });
+  try {
+    const r = await cli(dir, [], { OHMYBUG_URL: elsewhere.url });
+    assert.equal(r.code, 0);
+    assert.match(r.log, /named another host \(169\.254\.169\.254\); not answered/);
+  } finally { await elsewhere.close() }
+});
+
+test("a host that never answers fails after four tries, not at the timeout", async () => {
+  const { dir, git } = repo();
+  writeFileSync(join(dir, "app.js"), "export const a = 18\n");
+  git("commit", "-qam", "c");
+  const closed = createServer();
+  await new Promise((r) => closed.listen(0, "127.0.0.1", r));
+  const port = closed.address().port;
+  await new Promise((r) => closed.close(r));
+  const t = Date.now();
+  const r = await cli(dir, [], { OHMYBUG_URL: `http://127.0.0.1:${port}`, OHMYBUG_TIMEOUT_S: "600" });
+  assert.equal(r.code, 2);
+  assert.match(r.log, new RegExp(`cannot reach 127\\.0\\.0\\.1:${port} \\(ECONNREFUSED\\)`));
+  assert.ok(Date.now() - t < 60_000);
 });

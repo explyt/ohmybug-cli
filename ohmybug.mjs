@@ -2,8 +2,9 @@
 // ohmybug: review the git diff of the current folder with the OhMyBug hosted bug hunt, from a CI job or a shell.
 // One file, no dependencies, Node 18+. Exit 0: no medium or worse bug. 1: at least one. 2: the review could not run.
 import { execFileSync } from "node:child_process";
-import { lstatSync, readFileSync, realpathSync, statSync } from "node:fs";
-import { join, sep } from "node:path";
+import { copyFileSync, existsSync, realpathSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { isAbsolute, join } from "node:path";
 import { pathToFileURL } from "node:url";
 
 export const VERSION = "0.1.0";
@@ -19,22 +20,22 @@ else origin/main.
 Environment:
   OHMYBUG_API_KEY     required: a key from https://ohmybug.ai/me
   OHMYBUG_URL         default https://mcp.ohmybug.ai
-  OHMYBUG_TIMEOUT_S   how long to wait for the review, default 1800
+  OHMYBUG_TIMEOUT_S   how long to wait for the review, 30 to 86400 seconds, default 1800
 
-Behind a proxy: Node's fetch reads HTTPS_PROXY only on Node 24+ with NODE_USE_ENV_PROXY=1.
+Behind a proxy: Node's fetch reads HTTPS_PROXY only with NODE_USE_ENV_PROXY=1 (Node 22.21+, 24+).
 
 Exit codes: 0 no medium or worse bug, 1 at least one, 2 the review could not run, or was cut short with no
 medium or worse bug.`;
 
-/** Severity order, in lower case; P0-P3 is the same scale. */
+/** Severity order, in lower case; P0-P3 is the same scale. Medium or worse blocks: what OhMyBug bills as a real bug. */
 const RANK = { critical: 0, p0: 0, high: 1, p1: 1, medium: 2, p2: 2, low: 3, p3: 3 };
 const rankOf = (f) => RANK[String(f?.severity).toLowerCase()] ?? 4;
-/** Severities a pipeline gates on: the ones OhMyBug bills as real bugs. */
-export const BLOCKING = new Set(Object.keys(RANK).filter((k) => RANK[k] <= 2));
-const isBlocking = (f) => rankOf(f) <= 2;
+// A gate fails closed: a severity it does not know blocks.
+const isBlocking = (f) => rankOf(f) !== 3;
+const MAYBE_STARTED = "A hunt may have started: see https://ohmybug.ai/me";
 // Server caps: 30 files and about 10 MiB of diff and files per call; 20 files per answer to a file request.
 const MAX_FILES = 30, MAX_EXTRA = 20, MAX_BYTES = 9 * 1024 * 1024, MAX_BODY = 11_500_000, MAX_FILE = 512 * 1024;
-const MAX_TREE = 1024 * 1024, MAX_UNTRACKED = 500, MAX_UNTRACKED_BYTES = 8 * 1024 * 1024;
+const MAX_TREE = 1024 * 1024;
 // Pinned diff format, whatever the user's git config says (noprefix, mnemonicPrefix, textconv drivers).
 const DIFF_FLAGS = ["--no-color", "--no-ext-diff", "--no-textconv", "--src-prefix=a/", "--dst-prefix=b/"];
 const TRANSIENT_TOOL = new Set(["internal", "rate_limited"]);
@@ -70,46 +71,47 @@ export function resolveBase(opts, env, hasRef) {
 }
 
 /**
- * The change to review: { diff, changed, all, rev, base, skipped }. `all` is every path the client may send (the tree
- * at the reviewed commit, plus the untracked files with --uncommitted); `rev` is that commit's sha, null for the
- * working tree; `skipped` lists untracked paths left out of the diff.
+ * The change to review: { diff, changed, all, rev, base }. `rev` is the tree object reviewed: the commit's with a base,
+ * a snapshot of the working tree with --uncommitted. Every file sent is read from it, so a file request answered
+ * minutes later reads what was reviewed. `all` is every path in it.
  */
-export function selectChange(opts, env, git, root) {
+export function selectChange(opts, env, git, snapshot) {
+  let from, range, base;
   if (opts.uncommitted) {
-    let diff = git("diff", "HEAD", ...DIFF_FLAGS);
-    const untracked = git("ls-files", "--others", "--exclude-standard", "-z").split("\0").filter(Boolean);
-    // An untracked build folder would be thousands of git processes; a nested repository (`sub/`) is not a file.
-    const skipped = [];
-    let count = 0;
-    for (const p of untracked) {
-      let size = Infinity;
-      try { size = lstatSync(join(root, p)).size; } catch {}
-      const piece = !p.endsWith("/") && size <= MAX_UNTRACKED_BYTES && count < MAX_UNTRACKED ? gitNoIndex(git, p) : null;
-      if (piece === null) skipped.push(p); else { diff += piece; count++; }
-    }
-    const diffed = untracked.filter((p) => !skipped.includes(p));
-    const changed = [...git("diff", "HEAD", "--name-only", "--diff-filter=d", "-z").split("\0").filter(Boolean), ...diffed];
-    const all = [...git("ls-files", "-z").split("\0").filter(Boolean), ...diffed];
-    return { diff, changed, all, rev: null, base: "HEAD", skipped };
+    base = "HEAD";
+    // A repository with no commit yet is reviewed against the empty tree.
+    try { from = git("rev-parse", "--verify", "--quiet", "HEAD^{tree}").trim(); }
+    catch { from = git("hash-object", "-t", "tree", "/dev/null").trim(); }
+    range = [from, snapshot()];
+  } else {
+    base = resolveBase(opts, env, (ref) => { try { git("rev-parse", "--verify", "--quiet", `${ref}^{commit}`); return true; } catch { return false; } });
+    try { git("rev-parse", "--verify", "--quiet", `${base}^{commit}`); }
+    catch { throw new Refusal(`base ${base} is not a commit in this clone (${opts.base ? "fetch it, or check the ref" : "fetch it, or pass --base"})`); }
+    range = [`${base}...${git("rev-parse", "--verify", "HEAD^{commit}").trim()}`];
   }
-  const base = resolveBase(opts, env, (ref) => { try { git("rev-parse", "--verify", "--quiet", `${ref}^{commit}`); return true; } catch { return false; } });
-  try { git("rev-parse", "--verify", "--quiet", `${base}^{commit}`); }
-  catch { throw new Refusal(`base ${base} is not a commit in this clone (${opts.base ? "fetch it, or check the ref" : "fetch it, or pass --base"})`); }
-  // The sha, not HEAD: a file request answered minutes later reads the commit that was reviewed.
-  const rev = git("rev-parse", "--verify", "HEAD^{commit}").trim();
-  const range = `${base}...${rev}`;
-  const diff = git("diff", range, ...DIFF_FLAGS);
-  const changed = git("diff", range, "--name-only", "--diff-filter=d", "-z").split("\0").filter(Boolean);
+  const rev = git("rev-parse", "--verify", `${range.at(-1).split("...").pop()}^{tree}`).trim();
+  const diff = git("diff", ...range, ...DIFF_FLAGS);
+  const changed = git("diff", ...range, "--name-only", "--diff-filter=d", "-z").split("\0").filter(Boolean);
   const all = git("ls-tree", "-r", "--name-only", "-z", rev).split("\0").filter(Boolean);
-  return { diff, changed, all, rev, base, skipped: [] };
+  return { diff, changed, all, rev, base };
 }
 
-/** A new-file diff for an untracked path, or null when git cannot diff it (unreadable, special). */
-function gitNoIndex(git, path) {
-  // `git diff --no-index` exits 1 when there is a difference, which is the point.
-  try { return git("diff", "--no-index", ...DIFF_FLAGS, "--", "/dev/null", path); }
-  catch (e) { return e.status === 1 && e.stdout ? e.stdout.toString() : null; }
+/**
+ * The working tree, untracked files included and ignored ones not, as a tree object, built in a throwaway index so
+ * the user's own index is untouched (the blobs land in the object store, where git gc finds them). A nested
+ * repository is left out: git cannot add one with no commit checked out.
+ */
+function snapshotTree(git, gitWith, root) {
+  const index = join(tmpdir(), `ohmybug-index-${process.pid}-${Date.now()}`);
+  try {
+    const real = git("rev-parse", "--git-path", "index").trim();
+    try { copyFileSync(isAbsolute(real) ? real : join(root, real), index); } catch {} // no index yet: start empty
+    const nested = git("ls-files", "--others", "--exclude-standard", "--directory", "-z").split("\0").filter((p) => p.endsWith("/") && isRepo(join(root, p)));
+    gitWith({ GIT_INDEX_FILE: index }, "add", "-A", "--", ".", ...nested.map((p) => `:(exclude,top,literal)${p}`));
+    return gitWith({ GIT_INDEX_FILE: index }, "write-tree").trim();
+  } finally { rmSync(index, { force: true }); }
 }
+const isRepo = (dir) => existsSync(join(dir, ".git"));
 
 // A diff over the server's 2 MiB cut is split across reviewers; its per-file entries over 160 KiB are lockfiles,
 // bundles or generated output: dropped, unless none would be left.
@@ -125,32 +127,21 @@ export function trimDiff(diff, log = () => {}) {
 }
 
 /**
- * path → text or null. Only a path of the change's own list is read, never one under .git (in any case), so a request
- * can not reach an ignored file; from the reviewed commit, or the working tree with --uncommitted (where the list
- * holds the untracked files of the diff too).
- * Missing, binary, LFS pointers and files over MAX_FILE read as null.
+ * path → text or null, from the reviewed tree. Only a path in it is read, so a request cannot reach an ignored file,
+ * .git, or anything outside the repository; a symlink reads as its target's name. Missing, binary, LFS pointers and
+ * files over MAX_FILE read as null.
  */
-export function fileReader(root, change, gitBuf) {
+export function fileReader(change, gitBuf) {
   const known = new Set(change.all);
-  const allowed = (p) => known.has(p) && !p.split("/").some((s) => s.toLowerCase() === ".git");
-  const text = (buf) => {
-    if (buf.subarray(0, 8000).includes(0)) return null;
-    const s = buf.toString("utf8");
-    return s.startsWith("version https://git-lfs.github.com/spec/") ? null : s;
-  };
   return (requested) => {
     const path = String(requested).replace(/^\/+/, "");
-    if (!allowed(path)) return null;
+    if (!known.has(path)) return null;
     try {
-      if (change.rev) {
-        if (Number(gitBuf("cat-file", "-s", `${change.rev}:${path}`)) > MAX_FILE) return null;
-        return text(gitBuf("cat-file", "blob", `${change.rev}:${path}`));
-      }
-      // A symlink is followed only to another file of the list.
-      const abs = realpathSync(join(root, path));
-      if (!abs.startsWith(root + sep) || !allowed(abs.slice(root.length + 1).split(sep).join("/"))) return null;
-      const st = statSync(abs);
-      return st.isFile() && st.size <= MAX_FILE ? text(readFileSync(abs)) : null;
+      if (Number(gitBuf("cat-file", "-s", `${change.rev}:${path}`)) > MAX_FILE) return null;
+      const buf = gitBuf("cat-file", "blob", `${change.rev}:${path}`);
+      if (buf.subarray(0, 8000).includes(0)) return null;
+      const text = buf.toString("utf8");
+      return text.startsWith("version https://git-lfs.github.com/spec/") ? null : text;
     } catch { return null; }
   };
 }
@@ -214,7 +205,7 @@ export function formatFindings(findings) {
   }).join("\n\n");
 }
 
-/** Context files dropped from the end until the JSON body (escaping included) fits the server's cap. */
+/** Context files dropped from the end until the JSON body (escaping and meta included) fits the server's cap. */
 export function fitBody(body, max = MAX_BODY) {
   const files = [...body.files];
   while (files.length > 1 && Buffer.byteLength(JSON.stringify({ ...body, files })) > max) files.pop();
@@ -238,19 +229,21 @@ export async function run({ argv, env, cwd, out = (s) => process.stdout.write(s 
   if (opts.help) { out(USAGE); return 0; }
   if (opts.version) { out(VERSION); return 0; }
   if (!env.OHMYBUG_API_KEY) { log("OHMYBUG_API_KEY is not set: create a key at https://ohmybug.ai/me"); return 2; }
+  // Under 30 s no poll fits before the deadline: refused before a paid hunt starts.
   const timeoutS = Number(env.OHMYBUG_TIMEOUT_S || 1800);
-  if (!Number.isFinite(timeoutS) || timeoutS <= 0) { log(`OHMYBUG_TIMEOUT_S must be a number of seconds, not ${env.OHMYBUG_TIMEOUT_S}`); return 2; }
+  if (!Number.isInteger(timeoutS) || timeoutS < 30 || timeoutS > 86400) { log(`OHMYBUG_TIMEOUT_S must be whole seconds from 30 to 86400, not ${env.OHMYBUG_TIMEOUT_S}`); return 2; }
   const api = (env.OHMYBUG_URL || "https://mcp.ohmybug.ai").replace(/\/$/, "");
   const deadline = Date.now() + timeoutS * 1000;
   const sleep = (ms) => new Promise((r) => setTimeout(r, Math.max(0, Math.min(ms, deadline - Date.now()))));
-  const execGit = (dir, a) => execFileSync("git", ["-C", dir, ...a], { maxBuffer: 256 * 1024 * 1024, stdio: ["ignore", "pipe", "pipe"] });
+  const execGit = (dir, a, extra) => execFileSync("git", ["-C", dir, ...a], { maxBuffer: 256 * 1024 * 1024, stdio: ["ignore", "pipe", "pipe"], ...(extra ? { env: { ...process.env, ...extra } } : {}) });
 
   /**
-   * POST and return the body text, retrying network errors, 408, 429 and 5xx until the deadline. With `once` (a call
-   * that starts a paid hunt) only failures that prove the server never took the request are retried.
+   * POST and return the body text, retrying network errors, 408, 429 and 5xx until the deadline; a host never reached
+   * fails after four tries. With `once` (the call that starts a paid hunt) only failures that prove the server never
+   * took the request are retried. `upload` (a large body) is not cut at 60 s.
    */
   let reached = false;
-  async function http(url, init, once = false) {
+  async function http(url, init, { once = false, upload = once } = {}) {
     const keyed = Boolean(init.headers?.authorization);
     for (let attempt = 0; ; attempt++) {
       const left = deadline - Date.now();
@@ -258,13 +251,13 @@ export async function run({ argv, env, cwd, out = (s) => process.stdout.write(s 
       let why, retryAfter = 0;
       try {
         // A paid call is not cut at 60 s: a multi-MB upload on a slow uplink takes longer, and it is not resent.
-        const res = await fetch(url, { ...init, signal: AbortSignal.timeout(once ? left : Math.min(60_000, left)) });
+        const res = await fetch(url, { ...init, signal: AbortSignal.timeout(upload ? left : Math.min(60_000, left)) });
         reached = true;
         const text = await res.text();
         if (res.ok) return text;
         if ((res.status === 401 || res.status === 403) && keyed) throw new Refusal(`the API key was refused (HTTP ${res.status})`);
         const retryable = res.status === 429 || (!once && (res.status === 408 || res.status >= 500));
-        if (!retryable) throw new Refusal(`HTTP ${res.status} ${text.slice(0, 300)}`);
+        if (!retryable) throw new Refusal(`HTTP ${res.status} ${text.slice(0, 300)}${once && res.status >= 500 ? `. ${MAYBE_STARTED}` : ""}`);
         why = `HTTP ${res.status}`;
         retryAfter = Number(res.headers.get("retry-after")) * 1000 || 0;
       } catch (e) {
@@ -272,12 +265,12 @@ export async function run({ argv, env, cwd, out = (s) => process.stdout.write(s 
         why = e.cause?.code ?? e.message;
         const unreachable = ["ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN"].includes(e.cause?.code);
         if (once && !unreachable) {
-          throw new Refusal(`no clear answer (${why}); not sent again, so as not to start a second hunt. A hunt may have started: see https://ohmybug.ai/me`);
+          throw new Refusal(`no clear answer (${why}); not sent again, so as not to start a second hunt. ${MAYBE_STARTED}`);
         }
         // A host never reached is a wrong OHMYBUG_URL or a proxy-only runner, not a blip worth the whole timeout.
         if (unreachable && !reached && attempt >= 3) {
           const proxy = env.HTTPS_PROXY || env.https_proxy || env.HTTP_PROXY || env.http_proxy;
-          throw new Refusal(`cannot reach ${new URL(url).host} (${why})${proxy ? "; Node's fetch ignores HTTPS_PROXY unless Node 24+ runs with NODE_USE_ENV_PROXY=1" : ""}`);
+          throw new Refusal(`cannot reach ${new URL(url).host} (${why})${proxy ? "; Node's fetch reads HTTPS_PROXY only with NODE_USE_ENV_PROXY=1 (Node 22.21+, 24+)" : ""}`);
         }
       }
       const wait = Math.max(retryAfter, Math.min(30_000, 2000 * 2 ** attempt));
@@ -292,7 +285,7 @@ export async function run({ argv, env, cwd, out = (s) => process.stdout.write(s 
         method: "POST",
         headers: { authorization: `Bearer ${env.OHMYBUG_API_KEY}`, "content-type": "application/json", accept: "application/json, text/event-stream" },
         body: JSON.stringify({ jsonrpc: "2.0", id: ++rpcId, method: "tools/call", params: { name, arguments: args } }),
-      }, once);
+      }, { once });
       let msg, body, raw;
       try {
         msg = rpcMessage(text);
@@ -300,7 +293,7 @@ export async function run({ argv, env, cwd, out = (s) => process.stdout.write(s 
         body = msg.error || !raw.trimStart().startsWith("{") ? null : JSON.parse(raw);
       } catch (e) {
         // A garbled answer to a poll is read again; to the paid call it is no clear answer, and is not resent.
-        if (once) throw new Refusal(`${name}: unreadable answer; not sent again. A hunt may have started: see https://ohmybug.ai/me`);
+        if (once) throw new Refusal(`${name}: unreadable answer; not sent again. ${MAYBE_STARTED}`);
         log(`${name}: unreadable answer; retrying`);
         await sleep(Math.min(30_000, 2000 * 2 ** attempt));
         if (Date.now() >= deadline) throw new Deadline("timed out");
@@ -326,16 +319,14 @@ export async function run({ argv, env, cwd, out = (s) => process.stdout.write(s 
     try { root = realpathSync(execGit(cwd, ["rev-parse", "--show-toplevel"]).toString().trim()); }
     catch { throw new Refusal("this folder is not inside a git repository"); }
     const gitBuf = (...a) => execGit(root, a), git = (...a) => gitBuf(...a).toString();
-    const change = selectChange(opts, env, git, root);
-    if (change.skipped.length) log(`left out ${change.skipped.length} untracked path(s): over ${MAX_UNTRACKED_BYTES} bytes, past the first ${MAX_UNTRACKED}, or not a file (${change.skipped.slice(0, 3).join(", ")})`);
-    if (!change.diff.trim()) {
-      if (change.skipped.length) throw new Refusal("the only changes are untracked paths this client leaves out");
-      out(`Nothing to review: no changes against ${change.base}.`);
-      return 0;
-    }
+    const change = selectChange(opts, env, git, () => snapshotTree(git, (extra, ...a) => execGit(root, a, extra).toString(), root));
+    if (!change.diff.trim()) { out(`Nothing to review: no changes against ${change.base}.`); return 0; }
     const diff = trimDiff(change.diff, log);
-    if (Buffer.byteLength(diff) > MAX_BYTES) throw new Refusal(`the diff is ${Buffer.byteLength(diff)} bytes, over the ${MAX_BYTES} the service takes: review a smaller range with --base`);
-    const read = fileReader(root, change, gitBuf);
+    // Raw and escaped: a quote- or tab-heavy diff can pass the first and not the second.
+    if (Buffer.byteLength(diff) > MAX_BYTES || Buffer.byteLength(JSON.stringify(diff)) > MAX_BODY - 64 * 1024) {
+      throw new Refusal(`the diff is ${Buffer.byteLength(diff)} bytes, over what the service takes: review a smaller range with --base`);
+    }
+    const read = fileReader(change, gitBuf);
     // The reviewers can ask for any file by path; without the list they cannot name a caller to ask for.
     let listing = change.all.join("\n");
     if (Buffer.byteLength(listing) > MAX_TREE) {
@@ -343,12 +334,12 @@ export async function run({ argv, env, cwd, out = (s) => process.stdout.write(s 
       listing = `${listing.slice(0, listing.lastIndexOf("\n"))}\n# (list cut at ${MAX_TREE} bytes)`;
     }
     const tree = { path: ".review-client/tree.txt", content: `# Every file path in this repository at the reviewed head, one per line. Sent by the review client; request any of them.\n${listing}\n` };
-    const { files } = fitBody({ diff, files: [tree, ...pack(read, contextPaths(change.changed, change.all, git, change.rev), MAX_FILES - 1, MAX_BYTES - Buffer.byteLength(diff) - Buffer.byteLength(tree.content))] });
+    const meta = ciMeta(env, git);
+    const args = fitBody({ diff, files: [tree, ...pack(read, contextPaths(change.changed, change.all, git, change.rev), MAX_FILES - 1, MAX_BYTES - Buffer.byteLength(diff) - Buffer.byteLength(tree.content))], ...(Object.keys(meta).length ? { meta } : {}) });
     log(`reviewing ${change.changed.length} changed file(s) against ${change.base}`);
 
-    const meta = ciMeta(env, git);
-    const sub = await tool("submit_review", { diff, files, ...(Object.keys(meta).length ? { meta } : {}) }, true);
-    if (!sub.review_id) throw new Refusal(`submit_review answered without a review id: ${JSON.stringify(sub).slice(0, 300)}`);
+    const sub = await tool("submit_review", args, true);
+    if (!sub.review_id) throw new Refusal(`submit_review answered without a review id: ${JSON.stringify(sub).slice(0, 300)}. ${MAYBE_STARTED}`);
     started = sub;
     log(`review ${sub.review_id} started${sub.recent_median_minutes ? `; recent ones took about ${sub.recent_median_minutes} min` : ""}`);
     if (sub.live_url) log(`live progress: ${sub.live_url}`);
@@ -367,19 +358,22 @@ export async function run({ argv, env, cwd, out = (s) => process.stdout.write(s 
         const code = exitCodeFor({ ...r, findings });
         if (r.status === "failed") log(`the review failed: ${String(r.error ?? r.summary ?? "no reason given").slice(0, 300)}`);
         else if (findings.length) out(formatFindings(findings));
-        else out("No bugs found.");
+        else out(code === 2 ? "No bugs found before the review was cut short." : "No bugs found.");
         if (code === 2 && r.status === "done") log("the review did not finish its protocol: this is not a clean result");
         if (r.billing) log(`billing: ${r.billing.charged_usd ? `$${r.billing.charged_usd}` : "nothing"} charged${r.billing.paid_by ? ` (${r.billing.paid_by})` : ""}`);
         if (r.live_url) out(`\nReport: ${r.live_url}`);
-        out(code === 1 ? `\n${findings.filter(isBlocking).length} blocking bug(s): medium or worse.` : code === 0 ? "\nNo blocking bugs." : "");
+        if (code !== 2) out(code === 1 ? `\n${findings.filter(isBlocking).length} blocking bug(s): medium or worse.` : "\nNo blocking bugs.");
         return code;
       }
       if (r.status === "needs_files" && r.files_url && !answered.has(r.files_url)) {
+        answered.add(r.files_url);
+        // Repository files go only to the service this run talks to.
+        if (new URL(r.files_url, api).origin !== new URL(api).origin) { log(`a file request named another host (${new URL(r.files_url, api).host}); not answered`); continue; }
         const sent = pack(read, (r.requested_files ?? []).slice(0, 200), MAX_EXTRA, MAX_BYTES);
         log(`the reviewers asked for ${(r.requested_files ?? []).length} file(s); sending ${sent.length}`);
-        try { await http(r.files_url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(fitBody({ files: sent })) }); }
+        // A refused answer is not resent: the service gives up on a file request after a few minutes and goes on.
+        try { await http(new URL(r.files_url, api).href, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(fitBody({ files: sent })) }, { upload: true }); }
         catch (e) { if (!(e instanceof Refusal)) throw e; log(`the file answer was refused (${e.message}); continuing`); }
-        answered.add(r.files_url);
         continue;
       }
       if (Date.now() >= deadline) throw new Deadline("timed out");
