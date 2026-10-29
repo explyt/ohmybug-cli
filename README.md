@@ -10,11 +10,13 @@ One file, no dependencies, Node.js 18 or newer.
 curl -fsSL https://raw.githubusercontent.com/explyt/ohmybug-cli/main/install.sh | sh
 ```
 
-Or download [`ohmybug.mjs`](ohmybug.mjs) and run it with `node ohmybug.mjs`. The installer takes the latest `main`; to pin a version in CI, download the file of a release tag instead:
+Or download [`ohmybug.mjs`](ohmybug.mjs) and run it with `node ohmybug.mjs`. The installer takes the latest `main`; to pin a release in CI, name its file:
 
 ```sh
-curl -fsSLo ohmybug.mjs https://raw.githubusercontent.com/explyt/ohmybug-cli/v0.1.0/ohmybug.mjs && node ohmybug.mjs
+curl -fsSL https://raw.githubusercontent.com/explyt/ohmybug-cli/main/install.sh | OHMYBUG_CLI_URL=https://raw.githubusercontent.com/explyt/ohmybug-cli/v0.1.0/ohmybug.mjs sh
 ```
+
+Behind a proxy: Node's `fetch` reads `HTTPS_PROXY` only on Node 24 or newer with `NODE_USE_ENV_PROXY=1`.
 
 ## Use
 
@@ -72,6 +74,8 @@ pipelines:
     '**':
       - step:
           image: node:22
+          clone:
+            depth: full
           script:
             # The clone tracks one branch: name where the target goes, or origin/<target> does not exist.
             - git fetch origin "+refs/heads/$BITBUCKET_PR_DESTINATION_BRANCH:refs/remotes/origin/$BITBUCKET_PR_DESTINATION_BRANCH"
@@ -81,7 +85,7 @@ pipelines:
 
 ## What is sent
 
-The diff, the list of file paths at the reviewed head, and up to 29 related files (the changed files, the project manifests, and files that mention a changed module). During the review the reviewers may ask for more files by path. Every file sent is one of the repository's tracked files, read from the reviewed commit; with `--uncommitted`, from the working tree, untracked files included. Ignored files, anything under `.git` and anything outside the repository are never sent.
+The diff, the list of file paths at the reviewed head, and up to 29 related files (the changed files, the project manifests, and files that mention a changed module). During the review the reviewers may ask for more files by path. Every file sent is one of the repository's tracked files, read from the reviewed commit; with `--uncommitted`, from the working tree, untracked files included. Ignored files, anything under `.git` and anything outside the repository are never sent. With the review go the branch name and, in a GitLab merge request pipeline, the merge request title and description.
 
 ## Develop
 

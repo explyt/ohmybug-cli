@@ -3,10 +3,10 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, writeFileSync, mkdirSync } from "node:fs";
+import { mkdtempSync, writeFileSync, mkdirSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ciMeta, exitCodeFor, parseArgs, resolveBase, rpcMessage, run, trimDiff } from "../ohmybug.mjs";
+import { ciMeta, exitCodeFor, fitBody, parseArgs, resolveBase, rpcMessage, run, trimDiff } from "../ohmybug.mjs";
 
 function repo() {
   const dir = mkdtempSync(join(tmpdir(), "ohmybug-cli-"));
@@ -27,9 +27,10 @@ function repo() {
 /**
  * A review server that answers submit_review, wait_review and get_findings with `findings` and `status`. `requested`
  * makes the first wait_review a file request whose answer lands in `posted`; `sse` answers as an event stream;
- * `submitStatus` fails submit_review with that HTTP status; `toolError` answers every tool call with isError.
+ * `submitStatus` fails submit_review with that HTTP status; `toolError` answers every tool call with isError;
+ * `faults` fails the first call of a tool: { wait_review: 503 | "reset" | "garble" }.
  */
-async function server({ findings = [], status = "done", review_of_record = true, httpStatus = 200, requested, sse = false, submitStatus, toolError } = {}) {
+async function server({ findings = [], status = "done", review_of_record = true, httpStatus = 200, requested, sse = false, submitStatus, toolError, faults = {} } = {}) {
   const calls = [], posted = [];
   let url;
   const srv = createServer((req, res) => {
@@ -42,6 +43,13 @@ async function server({ findings = [], status = "done", review_of_record = true,
       const { name, arguments: args } = msg.params;
       calls.push({ name, args, auth: req.headers.authorization });
       if (name === "submit_review" && submitStatus) { res.writeHead(submitStatus); return res.end("boom"); }
+      const fault = faults[name];
+      if (fault) {
+        delete faults[name];
+        if (fault === "reset") return req.socket.destroy();
+        if (fault === "garble") { res.writeHead(200, { "content-type": "application/json" }); return res.end("{\"jsonrpc\":"); }
+        res.writeHead(fault); return res.end("busy");
+      }
       const asked = name === "wait_review" && requested && !posted.length;
       const result = toolError ? toolError
         : name === "submit_review" ? { review_id: "rev_test", status: "running" }
@@ -298,7 +306,9 @@ test("could not run: no key, a refused key, a failed review, a base the clone la
   writeFileSync(join(dir, "app.js"), "export const a = 8\n");
   git("commit", "-qam", "c");
   assert.equal((await cli(dir, [], { OHMYBUG_API_KEY: "" })).code, 2);
-  assert.equal((await cli(dir, ["--base", "nope"], { OHMYBUG_URL: "http://127.0.0.1:9" })).code, 2);
+  const nope = await cli(dir, ["--base", "nope"], { OHMYBUG_URL: "http://127.0.0.1:9" });
+  assert.equal(nope.code, 2);
+  assert.match(nope.log, /base nope is not a commit in this clone \(fetch it, or check the ref\)/);
   for (const [opts, why] of [[{ httpStatus: 401 }, /API key was refused/], [{ status: "failed" }, /the review failed/], [{ review_of_record: false }, /did not finish its protocol/]]) {
     const s = await server(opts);
     try {
@@ -307,4 +317,88 @@ test("could not run: no key, a refused key, a failed review, a base the clone la
       assert.match(r.log, why);
     } finally { await s.close() }
   }
+});
+
+test("--uncommitted follows a symlink only to another file of the change, never to an ignored or outside file", async () => {
+  const { dir } = repo();
+  writeFileSync(join(dir, ".gitignore"), ".env\n");
+  writeFileSync(join(dir, ".env"), "SECRET=1\n");
+  writeFileSync(join(dir, "app.js"), "export const a = 13\n");
+  symlinkSync(".env", join(dir, "cfg"));
+  symlinkSync("/etc/hosts", join(dir, "out"));
+  symlinkSync("app.js", join(dir, "ok"));
+  const s = await server({ requested: ["cfg", "out", "ok"] });
+  try {
+    assert.equal((await cli(dir, ["--uncommitted"], { OHMYBUG_URL: s.url })).code, 0);
+    assert.deepEqual(s.posted[0].files, [{ path: "ok", content: "export const a = 13\n" }]);
+  } finally { await s.close() }
+});
+
+test("submit_review: a 429 is sent again and starts one hunt; a reset or an internal error is not sent again", async () => {
+  const { dir, git } = repo();
+  writeFileSync(join(dir, "app.js"), "export const a = 14\n");
+  git("commit", "-qam", "c");
+  for (const [opts, code, submits] of [
+    [{ faults: { submit_review: 429 } }, 0, 2],
+    [{ faults: { submit_review: "reset" } }, 2, 1],
+    [{ toolError: { error: "internal", message: "late failure" } }, 2, 1],
+  ]) {
+    const s = await server(opts);
+    try {
+      const r = await cli(dir, [], { OHMYBUG_URL: s.url });
+      assert.equal(r.code, code, JSON.stringify(opts) + r.log);
+      assert.equal(s.calls.filter((c) => c.name === "submit_review").length, submits, JSON.stringify(opts));
+      // The server counts what it received: one hunt, however many attempts reached it.
+      if (code === 2) assert.match(r.log, /not sent again|late failure/);
+    } finally { await s.close() }
+  }
+});
+
+test("polling outlives a 5xx, a reset and a garbled answer", async () => {
+  const { dir, git } = repo();
+  writeFileSync(join(dir, "app.js"), "export const a = 15\n");
+  git("commit", "-qam", "c");
+  for (const fault of [503, "reset", "garble"]) {
+    const s = await server({ findings: [high], faults: { wait_review: fault } });
+    try { assert.equal((await cli(dir, [], { OHMYBUG_URL: s.url, OHMYBUG_TIMEOUT_S: "60" })).code, 1, String(fault)); } finally { await s.close() }
+  }
+});
+
+test("a review still running at OHMYBUG_TIMEOUT_S exits 2 and names the review", async () => {
+  const { dir, git } = repo();
+  writeFileSync(join(dir, "app.js"), "export const a = 16\n");
+  git("commit", "-qam", "c");
+  const s = await server({ status: "running" });
+  try {
+    const r = await cli(dir, [], { OHMYBUG_URL: s.url, OHMYBUG_TIMEOUT_S: "17" });
+    assert.equal(r.code, 2);
+    assert.match(r.log, /no result within OHMYBUG_TIMEOUT_S/);
+    assert.match(r.log, /review rev_test may still be running/);
+  } finally { await s.close() }
+});
+
+test("--uncommitted: a nested repository is skipped, a 200 KiB untracked file is reviewed, skipped-only changes exit 2", async () => {
+  const { dir } = repo();
+  mkdirSync(join(dir, "sub"));
+  execFileSync("git", ["-C", join(dir, "sub"), "init", "-q"]);
+  writeFileSync(join(dir, "sub", "x.js"), "1\n");
+  const only = await cli(dir, ["--uncommitted"], { OHMYBUG_URL: "http://127.0.0.1:9" });
+  assert.equal(only.code, 2);
+  assert.match(only.log, /only changes are untracked paths/);
+  writeFileSync(join(dir, "big.js"), `export const big = "${"y".repeat(200 * 1024)}"\n`);
+  const s = await server();
+  try {
+    const r = await cli(dir, ["--uncommitted"], { OHMYBUG_URL: s.url });
+    assert.equal(r.code, 0);
+    assert.match(s.calls.find((c) => c.name === "submit_review").args.diff, /\+export const big/);
+    assert.match(r.log, /left out 1 untracked path/);
+  } finally { await s.close() }
+});
+
+test("fitBody drops context files from the end until the escaped JSON fits, never the first", () => {
+  const quotes = '"'.repeat(1000);
+  const body = { diff: "d", files: [{ path: "tree", content: "t" }, { path: "a", content: quotes }, { path: "b", content: quotes }] };
+  assert.deepEqual(fitBody(body, 2500).files.map((f) => f.path), ["tree", "a"]);
+  assert.deepEqual(fitBody(body, 10).files.map((f) => f.path), ["tree"]);
+  assert.equal(fitBody(body, 1e6).files.length, 3);
 });
