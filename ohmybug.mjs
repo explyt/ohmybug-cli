@@ -140,7 +140,7 @@ export function fileReader(change, gitBuf) {
     const path = String(requested).replace(/^\/+/, "");
     if (!known.has(path)) return null;
     try {
-      if (Number(gitBuf("cat-file", "-s", `${change.rev}:${path}`)) > MAX_FILE) return null;
+      if (Number(gitBuf("cat-file", "-s", `${change.rev}:${path}`).toString()) > MAX_FILE) return null;
       const buf = gitBuf("cat-file", "blob", `${change.rev}:${path}`);
       if (buf.subarray(0, 8000).includes(0)) return null;
       const text = buf.toString("utf8");
@@ -287,6 +287,11 @@ export async function run({ argv, env, cwd, out = (s) => process.stdout.write(s 
         }
       }
       const wait = Math.max(retryAfter, Math.min(30_000, 2000 * 2 ** attempt));
+      // A wait the deadline cannot fit ends now, not after idling to the deadline.
+      if (wait >= deadline - Date.now() - (once ? POLL_ROOM : 0)) {
+        if (once) throw new Refusal(`${why}: the service asks to wait ${Math.round(wait / 1000)}s, more than OHMYBUG_TIMEOUT_S leaves; nothing was started`);
+        throw new Deadline("timed out");
+      }
       log(`${why}; retrying in ${Math.round(wait / 1000)}s`);
       await sleep(wait);
     }
@@ -299,25 +304,26 @@ export async function run({ argv, env, cwd, out = (s) => process.stdout.write(s 
         headers: { authorization: `Bearer ${env.OHMYBUG_API_KEY}`, "content-type": "application/json", accept: "application/json, text/event-stream" },
         body: JSON.stringify({ jsonrpc: "2.0", id: ++rpcId, method: "tools/call", params: { name, arguments: args } }),
       }, { once });
-      let msg, body, raw;
+      let msg = null, body = null, raw = "";
       try {
         msg = rpcMessage(text);
         raw = msg.result?.content?.[0]?.text ?? "";
         body = msg.error || !raw.trimStart().startsWith("{") ? null : JSON.parse(raw);
-      } catch (e) {
-        // A garbled answer to a poll is read again; to the paid call it is no clear answer, and is not resent.
-        if (once) throw new Refusal(`${name}: unreadable answer; not sent again. ${MAYBE_STARTED}`);
-        log(`${name}: unreadable answer; retrying`);
+      } catch {}
+      // A garbled answer, a protocol error or a plain-text answer: a poll asks again; the paid call is no clear
+      // answer, and is not resent.
+      if (!body) {
+        const what = !msg ? "unreadable answer" : msg.error ? `protocol error: ${msg.error.message}` : raw.slice(0, 300) || "empty answer";
+        if (once) throw new Refusal(`${name}: ${what}; not sent again. ${MAYBE_STARTED}`);
+        log(`${name}: ${what}; retrying`);
         await sleep(Math.min(30_000, 2000 * 2 ** attempt));
         if (Date.now() >= deadline) throw new Deadline("timed out");
         continue;
       }
-      if (msg.error) throw new Refusal(`${name}: ${msg.error.message}`);
-      if (!body) throw new Refusal(`${name}: ${raw.slice(0, 300) || "empty answer"}`);
       if (!msg.result?.isError) return body;
-      // An internal error may come after the hunt was created: a paid call retries only a rate limit.
+      // An internal error may come after the hunt was created: a paid call retries only a rate limit, and says so.
       if (!TRANSIENT_TOOL.has(body.error) || (once && body.error !== "rate_limited")) {
-        throw new Refusal(`${body.error ?? name}: ${body.message ?? raw.slice(0, 300)}`);
+        throw new Refusal(`${body.error ?? name}: ${body.message ?? raw.slice(0, 300)}${once && body.error === "internal" ? `. ${MAYBE_STARTED}` : ""}`);
       }
       const wait = Math.min(60_000, 5000 * 2 ** attempt);
       log(`${body.error}; retrying in ${wait / 1000}s`);

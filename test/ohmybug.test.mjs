@@ -61,6 +61,11 @@ async function server({ findings = [], status = "done", review_of_record = true,
         }
         if (fault === "reset") return req.socket.destroy();
         if (fault === "slow429") { res.writeHead(429, { "retry-after": "15" }); return res.end("slow down"); }
+        if (fault === "hour429") { res.writeHead(429, { "retry-after": "3600" }); return res.end("slow down"); }
+        if (fault === "rpcerror") {
+          res.writeHead(200, { "content-type": "application/json" });
+          return res.end(JSON.stringify({ jsonrpc: "2.0", id: msg.id, error: { code: -32603, message: "Internal error" } }));
+        }
         if (String(fault).startsWith("http")) { res.writeHead(307, { location: fault }); return res.end(); }
         if (fault === "garble") { res.writeHead(200, { "content-type": "application/json" }); return res.end("{\"jsonrpc\":"); }
         res.writeHead(fault); return res.end("busy");
@@ -373,7 +378,7 @@ test("submit_review: a 429 is sent again and starts one hunt; a reset or an inte
       assert.equal(r.code, code, JSON.stringify(opts) + r.log);
       assert.equal(s.calls.filter((c) => c.name === "submit_review").length, submits, JSON.stringify(opts));
       // The server counts what it received: one hunt, however many attempts reached it.
-      if (code === 2) assert.match(r.log, /A hunt may have started|late failure/);
+      if (code === 2) assert.match(r.log, /A hunt may have started/);
     } finally { await s.close() }
   }
 });
@@ -382,7 +387,7 @@ test("polling outlives a 5xx, a reset, a garbled answer and a transient tool err
   const { dir, git } = repo();
   writeFileSync(join(dir, "app.js"), "export const a = 15\n");
   git("commit", "-qam", "c");
-  for (const fault of [503, "reset", "garble", "internal", "rate_limited"]) {
+  for (const fault of [503, "reset", "garble", "internal", "rate_limited", "rpcerror"]) {
     const s = await server({ findings: [high], faults: { wait_review: fault } });
     try { assert.equal((await cli(dir, [], { OHMYBUG_URL: s.url, OHMYBUG_TIMEOUT_S: "60" })).code, 1, String(fault)); } finally { await s.close() }
   }
@@ -596,4 +601,33 @@ test("the CLI runs when started through the symlink the installer makes", () => 
   const link = join(dir, "ohmybug");
   symlinkSync(fileURLToPath(new URL("../ohmybug.mjs", import.meta.url)), link);
   assert.equal(execFileSync(process.execPath, [link, "--version"]).toString().trim(), VERSION);
+});
+
+test("a Retry-After longer than the time left stops at once, before a hunt starts", async () => {
+  const { dir, git } = repo();
+  writeFileSync(join(dir, "app.js"), "export const a = 24\n");
+  git("commit", "-qam", "c");
+  const s = await server({ faults: { submit_review: "hour429" } });
+  try {
+    const t = Date.now();
+    const r = await cli(dir, [], { OHMYBUG_URL: s.url, OHMYBUG_TIMEOUT_S: "1800" });
+    assert.equal(r.code, 2);
+    assert.match(r.log, /asks to wait 3600s.*nothing was started/);
+    assert.ok(Date.now() - t < 10_000);
+  } finally { await s.close() }
+});
+
+test("a file over 512 KiB is not sent, as context or on request", async () => {
+  const { dir, git } = repo();
+  writeFileSync(join(dir, "big.txt"), "z".repeat(600 * 1024) + "\n");
+  git("add", ".");
+  git("commit", "-qm", "big");
+  writeFileSync(join(dir, "app.js"), "export const a = 25\n");
+  git("commit", "-qam", "c");
+  git("update-ref", "refs/remotes/origin/main", "HEAD~1");
+  const s = await server({ requested: ["big.txt", "app.js"] });
+  try {
+    assert.equal((await cli(dir, [], { OHMYBUG_URL: s.url })).code, 0);
+    assert.deepEqual(s.posted[0].files.map((f) => f.path), ["app.js"]);
+  } finally { await s.close() }
 });
