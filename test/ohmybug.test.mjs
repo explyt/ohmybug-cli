@@ -4,9 +4,10 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, writeFileSync, mkdirSync, symlinkSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ciMeta, exitCodeFor, fitBody, parseArgs, resolveBase, rpcMessage, run, trimDiff } from "../ohmybug.mjs";
+import { ciMeta, exitCodeFor, fitBody, parseArgs, resolveBase, rpcMessage, run, trimDiff, VERSION } from "../ohmybug.mjs";
 
 function repo() {
   const dir = mkdtempSync(join(tmpdir(), "ohmybug-cli-"));
@@ -28,8 +29,10 @@ function repo() {
  * A review server that answers submit_review, wait_review and get_findings with `findings` and `status`. `requested`
  * makes the first wait_review a file request whose answer lands in `posted`; `sse` answers as an event stream;
  * `submitStatus` fails submit_review with that HTTP status; `toolError` answers every tool call with isError;
- * `faults` fails the first call of a tool: { wait_review: 503 | "reset" | "garble" | "internal" | "rate_limited" };
- * `filesStatus` answers the file upload with that status (a 307 goes to `filesLocation`); `filesUrl` replaces the
+ * `faults` fails the first call of a tool: { wait_review: 503 | "reset" | "garble" | "internal" | "rate_limited" |
+ * "slow429" (a 429 asking for 15 s) | a URL (a 307 there) };
+ * `filesStatus` answers the file upload with that status, or with each of a list in turn (a 307 goes to
+ * `filesLocation`); `filesUrl` replaces the
  * file request's address; `requestedAgain` makes the second wait_review a second request at the same address.
  */
 async function server({ findings = [], status = "done", review_of_record = true, httpStatus = 200, requested, requestedAgain, sse = false, submitStatus, toolError, faults = {}, filesStatus = 200, filesUrl, filesLocation } = {}, port = 0) {
@@ -40,7 +43,11 @@ async function server({ findings = [], status = "done", review_of_record = true,
     req.on("data", (c) => (body += c));
     req.on("end", () => {
       if (httpStatus !== 200) { res.writeHead(httpStatus); return res.end("no"); }
-      if (req.url === "/files") { posted.push(JSON.parse(body)); res.writeHead(filesStatus, filesLocation ? { location: filesLocation } : {}); return res.end("{}"); }
+      if (req.url === "/files") {
+        posted.push(JSON.parse(body));
+        res.writeHead(Array.isArray(filesStatus) ? filesStatus[posted.length - 1] ?? 200 : filesStatus, filesLocation ? { location: filesLocation } : {});
+        return res.end("{}");
+      }
       const msg = JSON.parse(body);
       const { name, arguments: args } = msg.params;
       calls.push({ name, args, auth: req.headers.authorization });
@@ -53,6 +60,8 @@ async function server({ findings = [], status = "done", review_of_record = true,
           return res.end(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { isError: true, content: [{ type: "text", text: JSON.stringify({ error: fault, message: "blip" }) }] } }));
         }
         if (fault === "reset") return req.socket.destroy();
+        if (fault === "slow429") { res.writeHead(429, { "retry-after": "15" }); return res.end("slow down"); }
+        if (String(fault).startsWith("http")) { res.writeHead(307, { location: fault }); return res.end(); }
         if (fault === "garble") { res.writeHead(200, { "content-type": "application/json" }); return res.end("{\"jsonrpc\":"); }
         res.writeHead(fault); return res.end("busy");
       }
@@ -533,4 +542,58 @@ test("a service that goes away mid-review is waited for: the fail-fast is only f
   await down;
   const again = await server({ findings: [high] }, port);
   try { assert.equal((await run).code, 1); } finally { await again.close() }
+});
+
+test("OHMYBUG_URL must be https, or http to this machine only", async () => {
+  const { dir } = repo();
+  for (const url of ["http://mcp.example.com", "mcp.example.com", "ftp://127.0.0.1"]) {
+    const r = await cli(dir, [], { OHMYBUG_URL: url });
+    assert.equal(r.code, 2, url);
+    assert.match(r.log, /OHMYBUG_URL (must be https|is not a URL)/, url);
+  }
+});
+
+test("a redirect on the paid call is not followed: the body never reaches the other host", async () => {
+  const { dir, git } = repo();
+  writeFileSync(join(dir, "app.js"), "export const a = 21\n");
+  git("commit", "-qam", "c");
+  const other = await server();
+  const s = await server({ faults: { submit_review: `${other.url}/mcp` } });
+  try {
+    const r = await cli(dir, [], { OHMYBUG_URL: s.url });
+    assert.equal(r.code, 2);
+    assert.equal(other.calls.length, 0);
+    assert.match(r.log, /A hunt may have started/);
+  } finally { await s.close(); await other.close() }
+});
+
+test("a rate limit that would leave no time to poll stops before the hunt starts", async () => {
+  const { dir, git } = repo();
+  writeFileSync(join(dir, "app.js"), "export const a = 22\n");
+  git("commit", "-qam", "c");
+  const s = await server({ faults: { submit_review: "slow429" } });
+  try {
+    const r = await cli(dir, [], { OHMYBUG_URL: s.url, OHMYBUG_TIMEOUT_S: "30" });
+    assert.equal(r.code, 2);
+    assert.match(r.log, /nothing was started/);
+    assert.equal(s.calls.filter((c) => c.name === "submit_review").length, 1);
+  } finally { await s.close() }
+});
+
+test("a file request whose answer failed is answered again when the service asks again", async () => {
+  const { dir, git } = repo();
+  writeFileSync(join(dir, "app.js"), "export const a = 23\n");
+  git("commit", "-qam", "c");
+  const s = await server({ requested: ["app.js"], requestedAgain: ["app.js"], filesStatus: [503, 200] });
+  try {
+    assert.equal((await cli(dir, [], { OHMYBUG_URL: s.url })).code, 0);
+    assert.equal(s.posted.length, 2);
+  } finally { await s.close() }
+});
+
+test("the CLI runs when started through the symlink the installer makes", () => {
+  const dir = mkdtempSync(join(tmpdir(), "ohmybug-cli-"));
+  const link = join(dir, "ohmybug");
+  symlinkSync(fileURLToPath(new URL("../ohmybug.mjs", import.meta.url)), link);
+  assert.equal(execFileSync(process.execPath, [link, "--version"]).toString().trim(), VERSION);
 });

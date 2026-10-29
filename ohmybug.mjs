@@ -34,6 +34,8 @@ const rankOf = (f) => RANK[String(f?.severity).toLowerCase()] ?? 4;
 // A gate fails closed: a severity it does not know blocks.
 const isBlocking = (f) => rankOf(f) !== 3;
 const MAYBE_STARTED = "A hunt may have started: see https://ohmybug.ai/me";
+// Time kept after the paid call for at least one poll and get_findings.
+const POLL_ROOM = 20_000;
 // Server caps: 30 files and about 10 MiB of diff and files per call; 20 files per answer to a file request.
 const MAX_FILES = 30, MAX_EXTRA = 20, MAX_BYTES = 9 * 1024 * 1024, MAX_BODY = 11_500_000, MAX_FILE = 512 * 1024;
 const MAX_TREE = 1024 * 1024;
@@ -172,7 +174,7 @@ function contextPaths(changed, all, git, rev) {
     .filter((s) => s.length >= 4 && !/^(index|main|init|__init__|readme|test|tests|utils)$/i.test(s)))].slice(0, 20);
   for (const stem of stems) {
     let out = "";
-    try { out = git("grep", "-l", "-I", "-F", "-w", "-z", "-e", stem, ...(rev ? [rev] : []), "--"); } catch { continue; } // exit 1: no match
+    try { out = git("grep", "--no-color", "-l", "-I", "-F", "-w", "-z", "-e", stem, ...(rev ? [rev] : []), "--"); } catch { continue; } // exit 1: no match
     for (const ref of out.split("\0").filter(Boolean)) {
       const p = rev ? ref.slice(rev.length + 1) : ref;
       if (!seen.has(p)) hits.set(p, (hits.get(p) ?? 0) + 1);
@@ -234,6 +236,13 @@ export async function run({ argv, env, cwd, out = (s) => process.stdout.write(s 
   const timeoutS = Number(env.OHMYBUG_TIMEOUT_S || 1800);
   if (!Number.isInteger(timeoutS) || timeoutS < 30 || timeoutS > 86400) { log(`OHMYBUG_TIMEOUT_S must be whole seconds from 30 to 86400, not ${env.OHMYBUG_TIMEOUT_S}`); return 2; }
   const api = (env.OHMYBUG_URL || "https://mcp.ohmybug.ai").replace(/\/$/, "");
+  // The key and the code travel in this request: https, or plain http to this machine only (a local test server).
+  let apiUrl;
+  try { apiUrl = new URL(api); } catch { log(`OHMYBUG_URL is not a URL: ${api}`); return 2; }
+  if (apiUrl.protocol !== "https:" && !(apiUrl.protocol === "http:" && ["127.0.0.1", "localhost", "[::1]"].includes(apiUrl.hostname))) {
+    log(`OHMYBUG_URL must be https (plain http only to this machine): ${api}`);
+    return 2;
+  }
   const deadline = Date.now() + timeoutS * 1000;
   const sleep = (ms) => new Promise((r) => setTimeout(r, Math.max(0, Math.min(ms, deadline - Date.now()))));
   const execGit = (dir, a, extra) => execFileSync("git", ["-C", dir, ...a], { maxBuffer: 256 * 1024 * 1024, stdio: ["ignore", "pipe", "pipe"], ...(extra ? { env: { ...process.env, ...extra } } : {}) });
@@ -241,29 +250,33 @@ export async function run({ argv, env, cwd, out = (s) => process.stdout.write(s 
   /**
    * POST and return the body text, retrying network errors, 408, 429 and 5xx until the deadline; a host never reached
    * fails after four tries. With `once` (the call that starts a paid hunt) only failures that prove the server never
-   * took the request are retried, and the request is not cut at 60 s: a multi-MB upload on a slow uplink takes longer.
+   * took the request are retried, and the request is not cut at 60 s (a multi-MB upload on a slow uplink takes longer)
+   * but at POLL_ROOM before the deadline, so a started hunt always gets polled. No redirect is followed: the body
+   * would go to wherever it points.
    */
   let reached = false;
   async function http(url, init, { once = false } = {}) {
-    const keyed = Boolean(init.headers?.authorization);
     for (let attempt = 0; ; attempt++) {
       const left = deadline - Date.now();
       if (left <= 0) throw new Deadline("timed out");
+      if (once && left <= POLL_ROOM) throw new Refusal("too little of OHMYBUG_TIMEOUT_S is left to start a hunt and wait for it; nothing was started");
       let why, retryAfter = 0;
       try {
-        const res = await fetch(url, { ...init, signal: AbortSignal.timeout(once ? left : Math.min(60_000, left)) });
+        const res = await fetch(url, { ...init, redirect: "error", signal: AbortSignal.timeout(once ? left - POLL_ROOM : Math.min(60_000, left)) });
         reached = true;
         const text = await res.text();
         if (res.ok) return text;
-        if ((res.status === 401 || res.status === 403) && keyed) throw new Refusal(`the API key was refused (HTTP ${res.status})`);
+        if (res.status === 401 || res.status === 403) throw new Refusal(`the API key was refused, or the request blocked (HTTP ${res.status} ${text.slice(0, 200)})`);
         const retryable = res.status === 429 || (!once && (res.status === 408 || res.status >= 500));
         if (!retryable) throw new Refusal(`HTTP ${res.status} ${text.slice(0, 300)}${once && res.status >= 500 ? `. ${MAYBE_STARTED}` : ""}`);
         why = `HTTP ${res.status}`;
-        retryAfter = Number(res.headers.get("retry-after")) * 1000 || 0;
+        const after = res.headers.get("retry-after");
+        retryAfter = Math.max(0, Number(after) * 1000 || Date.parse(after) - Date.now() || 0);
       } catch (e) {
         if (e instanceof Refusal) throw e;
         why = e.cause?.code ?? e.message;
-        const unreachable = ["ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN"].includes(e.cause?.code);
+        // Failures before any byte reached a server: safe to send again, even the paid call.
+        const unreachable = ["ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN", "ENETUNREACH", "EHOSTUNREACH", "UND_ERR_CONNECT_TIMEOUT"].includes(e.cause?.code);
         if (once && !unreachable) {
           throw new Refusal(`no clear answer (${why}); not sent again, so as not to start a second hunt. ${MAYBE_STARTED}`);
         }
@@ -319,8 +332,9 @@ export async function run({ argv, env, cwd, out = (s) => process.stdout.write(s 
    * origin, and a redirect is not followed (it would carry them elsewhere).
    */
   async function answerFiles(r) {
-    const url = new URL(r.files_url, api);
-    if (url.origin !== new URL(api).origin) { log(`a file request named another host (${url.host}); not answered`); return; }
+    let url;
+    try { url = new URL(r.files_url, api); } catch { log(`a file request named no usable address; not answered`); return true; }
+    if (url.origin !== apiUrl.origin) { log(`a file request named another host (${url.host}); not answered`); return true; }
     const sent = pack(read, (r.requested_files ?? []).slice(0, 200), MAX_EXTRA, MAX_BYTES);
     log(`the reviewers asked for ${(r.requested_files ?? []).length} file(s); sending ${sent.length}`);
     try {
@@ -328,8 +342,10 @@ export async function run({ argv, env, cwd, out = (s) => process.stdout.write(s 
         method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(fitBody({ files: sent })),
         redirect: "error", signal: AbortSignal.timeout(Math.max(1, Math.min(120_000, deadline - Date.now()))),
       });
-      if (!res.ok) log(`the file answer was refused (HTTP ${res.status}); continuing`);
+      if (res.ok) return true;
+      log(`the file answer was refused (HTTP ${res.status}); continuing`);
     } catch (e) { log(`the file answer did not go through (${e.cause?.code ?? e.cause?.message ?? e.message}); continuing`); }
+    return false;
   }
 
   let started, read;
@@ -341,7 +357,6 @@ export async function run({ argv, env, cwd, out = (s) => process.stdout.write(s 
     const change = selectChange(opts, env, git, () => snapshotTree(git, (extra, ...a) => execGit(root, a, extra).toString(), root));
     if (!change.diff.trim()) { out(`Nothing to review: no changes against ${change.base}.`); return 0; }
     const diff = trimDiff(change.diff, log);
-    // Raw and escaped: a quote- or tab-heavy diff can pass the first and not the second.
     read = fileReader(change, gitBuf);
     // The reviewers can ask for any file by path; without the list they cannot name a caller to ask for.
     let listing = change.all.join("\n");
@@ -350,9 +365,10 @@ export async function run({ argv, env, cwd, out = (s) => process.stdout.write(s 
       listing = `${listing.slice(0, listing.lastIndexOf("\n"))}\n# (list cut at ${MAX_TREE} bytes)`;
     }
     const tree = { path: ".review-client/tree.txt", content: `# Every file path in this repository at the reviewed head, one per line. Sent by the review client; request any of them.\n${listing}\n` };
-    // fitBody never drops the listing, so the diff and the listing together, escaped, leave room for meta (8 KB at most).
+    // Raw and escaped: a quote- or tab-heavy diff can pass the first and not the second. fitBody never drops the
+    // listing, so the diff and the listing together, escaped, leave room for meta (8 KB at most).
     if (Buffer.byteLength(diff) > MAX_BYTES || Buffer.byteLength(JSON.stringify(diff)) + Buffer.byteLength(JSON.stringify(tree.content)) > MAX_BODY - 64 * 1024) {
-      throw new Refusal(`the diff is ${Buffer.byteLength(diff)} bytes, over what the service takes: ${opts.uncommitted ? "commit part of it and review" : "review"} a smaller range with --base`);
+      throw new Refusal(`the diff (${Buffer.byteLength(diff)} bytes) and the file list are over what the service takes once encoded: ${opts.uncommitted ? "commit part of it and review" : "review"} a smaller range with --base`);
     }
     const meta = ciMeta(env, git);
     const args = fitBody({ diff, files: [tree, ...pack(read, contextPaths(change.changed, change.all, git, change.rev), MAX_FILES - 1, MAX_BYTES - Buffer.byteLength(diff) - Buffer.byteLength(tree.content))], ...(Object.keys(meta).length ? { meta } : {}) });
@@ -382,15 +398,14 @@ export async function run({ argv, env, cwd, out = (s) => process.stdout.write(s 
         if (code === 2 && r.status === "done") log("the review did not finish its protocol: this is not a clean result");
         if (r.billing) log(`billing: ${r.billing.charged_usd ? `$${r.billing.charged_usd}` : "nothing"} charged${r.billing.paid_by ? ` (${r.billing.paid_by})` : ""}`);
         if (r.live_url) out(`\nReport: ${r.live_url}`);
-        if (code !== 2) out(code === 1 ? `\n${findings.filter(isBlocking).length} blocking bug(s): medium or worse.` : "\nNo blocking bugs.");
+        if (code !== 2) out(code === 1 ? `\n${findings.filter(isBlocking).length} blocking bug(s): medium or worse, or unrated.` : "\nNo blocking bugs.");
         return code;
       }
-      // One answer per request: the same address may serve a later request for other files.
+      // One answer per request: the same address may serve a later request for other files. A failed answer is not
+      // marked, so a re-ask is answered again, one poll interval later.
       const request = r.status === "needs_files" && r.files_url ? `${r.files_url} ${[...(r.requested_files ?? [])].sort().join("\0")}` : null;
       if (request && !answered.has(request)) {
-        answered.add(request);
-        await answerFiles(r);
-        continue;
+        if (await answerFiles(r)) { answered.add(request); continue; }
       }
       if (Date.now() >= deadline) throw new Deadline("timed out");
       if (!r.timed_out) await sleep(5000);
