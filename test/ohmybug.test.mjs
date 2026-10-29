@@ -82,6 +82,8 @@ async function server({ findings = [], status = "done", review_of_record = true,
       res.end(sse ? `event: message\ndata: ${answer}\n\n` : answer);
     });
   });
+  // Node's 5 s default races the client's 5 s retry: a reused socket the server just closed reads as a reset.
+  srv.keepAliveTimeout = 60_000;
   await new Promise((r) => srv.listen(port, "127.0.0.1", r));
   url = `http://127.0.0.1:${srv.address().port}`;
   return { url, calls, posted, close: () => new Promise((r) => srv.close(r)) };
