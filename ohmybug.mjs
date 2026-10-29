@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 // ohmybug: review the git diff of the current folder with the OhMyBug hosted bug hunt, from a CI job or a shell.
-// One file, no dependencies, Node 18+. Exit 0: no medium or worse bug. 1: at least one. 2: the review could not run.
+// One file, no dependencies, Node 18+. Exit 0: no medium or worse bug. 1: at least one. 2: the review could not run,
+// or was cut short with no medium or worse bug.
 import { execFileSync } from "node:child_process";
-import { copyFileSync, existsSync, realpathSync, rmSync } from "node:fs";
+import { copyFileSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -106,12 +107,12 @@ function snapshotTree(git, gitWith, root) {
   try {
     const real = git("rev-parse", "--git-path", "index").trim();
     try { copyFileSync(isAbsolute(real) ? real : join(root, real), index); } catch {} // no index yet: start empty
-    const nested = git("ls-files", "--others", "--exclude-standard", "--directory", "-z").split("\0").filter((p) => p.endsWith("/") && isRepo(join(root, p)));
+    // Without --directory, git lists every untracked file and stops at a nested repository at any depth as `dir/`.
+    const nested = git("ls-files", "--others", "--exclude-standard", "-z").split("\0").filter((p) => p.endsWith("/"));
     gitWith({ GIT_INDEX_FILE: index }, "add", "-A", "--", ".", ...nested.map((p) => `:(exclude,top,literal)${p}`));
     return gitWith({ GIT_INDEX_FILE: index }, "write-tree").trim();
   } finally { rmSync(index, { force: true }); }
 }
-const isRepo = (dir) => existsSync(join(dir, ".git"));
 
 // A diff over the server's 2 MiB cut is split across reviewers; its per-file entries over 160 KiB are lockfiles,
 // bundles or generated output: dropped, unless none would be left.
@@ -161,7 +162,7 @@ function pack(read, paths, max, budget) {
 /** Project manifests and rule files a reviewer checks a change against. */
 const ROOT_FILES = /^(package\.json|pyproject\.toml|setup\.py|setup\.cfg|requirements[\w.-]*\.txt|go\.mod|Cargo\.toml|pom\.xml|build\.gradle(\.kts)?|Gemfile|composer\.json|tsconfig\.json|AGENTS\.md|CLAUDE\.md|CONTRIBUTING\.md|README\.md)$/i;
 
-/** Changed files first, then root manifests, then the files that mention a changed module by name, most mentions first. */
+/** Changed files first, then root manifests, then the files that name a changed module, those naming most of them first. */
 function contextPaths(changed, all, git, rev) {
   const seen = new Set(changed);
   const roots = all.filter((p) => !p.includes("/") && ROOT_FILES.test(p) && !seen.has(p));
@@ -240,18 +241,17 @@ export async function run({ argv, env, cwd, out = (s) => process.stdout.write(s 
   /**
    * POST and return the body text, retrying network errors, 408, 429 and 5xx until the deadline; a host never reached
    * fails after four tries. With `once` (the call that starts a paid hunt) only failures that prove the server never
-   * took the request are retried. `upload` (a large body) is not cut at 60 s.
+   * took the request are retried, and the request is not cut at 60 s: a multi-MB upload on a slow uplink takes longer.
    */
   let reached = false;
-  async function http(url, init, { once = false, upload = once } = {}) {
+  async function http(url, init, { once = false } = {}) {
     const keyed = Boolean(init.headers?.authorization);
     for (let attempt = 0; ; attempt++) {
       const left = deadline - Date.now();
       if (left <= 0) throw new Deadline("timed out");
       let why, retryAfter = 0;
       try {
-        // A paid call is not cut at 60 s: a multi-MB upload on a slow uplink takes longer, and it is not resent.
-        const res = await fetch(url, { ...init, signal: AbortSignal.timeout(upload ? left : Math.min(60_000, left)) });
+        const res = await fetch(url, { ...init, signal: AbortSignal.timeout(once ? left : Math.min(60_000, left)) });
         reached = true;
         const text = await res.text();
         if (res.ok) return text;
@@ -270,7 +270,7 @@ export async function run({ argv, env, cwd, out = (s) => process.stdout.write(s 
         // A host never reached is a wrong OHMYBUG_URL or a proxy-only runner, not a blip worth the whole timeout.
         if (unreachable && !reached && attempt >= 3) {
           const proxy = env.HTTPS_PROXY || env.https_proxy || env.HTTP_PROXY || env.http_proxy;
-          throw new Refusal(`cannot reach ${new URL(url).host} (${why})${proxy ? "; Node's fetch reads HTTPS_PROXY only with NODE_USE_ENV_PROXY=1 (Node 22.21+, 24+)" : ""}`);
+          throw new Refusal(`cannot reach ${new URL(url).host} (${why})${proxy && env.NODE_USE_ENV_PROXY !== "1" ? "; Node's fetch reads HTTPS_PROXY only with NODE_USE_ENV_PROXY=1 (Node 22.21+, 24+)" : ""}`);
         }
       }
       const wait = Math.max(retryAfter, Math.min(30_000, 2000 * 2 ** attempt));
@@ -313,7 +313,26 @@ export async function run({ argv, env, cwd, out = (s) => process.stdout.write(s 
     }
   }
 
-  let started;
+  /**
+   * One try at a file request, never fatal: the service gives up on a request after a few minutes and goes on without
+   * the files, so a failed answer costs the reviewers those files, not the run. Files go only to the service's own
+   * origin, and a redirect is not followed (it would carry them elsewhere).
+   */
+  async function answerFiles(r) {
+    const url = new URL(r.files_url, api);
+    if (url.origin !== new URL(api).origin) { log(`a file request named another host (${url.host}); not answered`); return; }
+    const sent = pack(read, (r.requested_files ?? []).slice(0, 200), MAX_EXTRA, MAX_BYTES);
+    log(`the reviewers asked for ${(r.requested_files ?? []).length} file(s); sending ${sent.length}`);
+    try {
+      const res = await fetch(url, {
+        method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(fitBody({ files: sent })),
+        redirect: "error", signal: AbortSignal.timeout(Math.max(1, Math.min(120_000, deadline - Date.now()))),
+      });
+      if (!res.ok) log(`the file answer was refused (HTTP ${res.status}); continuing`);
+    } catch (e) { log(`the file answer did not go through (${e.cause?.code ?? e.cause?.message ?? e.message}); continuing`); }
+  }
+
+  let started, read;
   try {
     let root;
     try { root = realpathSync(execGit(cwd, ["rev-parse", "--show-toplevel"]).toString().trim()); }
@@ -323,10 +342,7 @@ export async function run({ argv, env, cwd, out = (s) => process.stdout.write(s 
     if (!change.diff.trim()) { out(`Nothing to review: no changes against ${change.base}.`); return 0; }
     const diff = trimDiff(change.diff, log);
     // Raw and escaped: a quote- or tab-heavy diff can pass the first and not the second.
-    if (Buffer.byteLength(diff) > MAX_BYTES || Buffer.byteLength(JSON.stringify(diff)) > MAX_BODY - 64 * 1024) {
-      throw new Refusal(`the diff is ${Buffer.byteLength(diff)} bytes, over what the service takes: review a smaller range with --base`);
-    }
-    const read = fileReader(change, gitBuf);
+    read = fileReader(change, gitBuf);
     // The reviewers can ask for any file by path; without the list they cannot name a caller to ask for.
     let listing = change.all.join("\n");
     if (Buffer.byteLength(listing) > MAX_TREE) {
@@ -334,6 +350,10 @@ export async function run({ argv, env, cwd, out = (s) => process.stdout.write(s 
       listing = `${listing.slice(0, listing.lastIndexOf("\n"))}\n# (list cut at ${MAX_TREE} bytes)`;
     }
     const tree = { path: ".review-client/tree.txt", content: `# Every file path in this repository at the reviewed head, one per line. Sent by the review client; request any of them.\n${listing}\n` };
+    // fitBody never drops the listing, so the diff and the listing together, escaped, leave room for meta (8 KB at most).
+    if (Buffer.byteLength(diff) > MAX_BYTES || Buffer.byteLength(JSON.stringify(diff)) + Buffer.byteLength(JSON.stringify(tree.content)) > MAX_BODY - 64 * 1024) {
+      throw new Refusal(`the diff is ${Buffer.byteLength(diff)} bytes, over what the service takes: ${opts.uncommitted ? "commit part of it and review" : "review"} a smaller range with --base`);
+    }
     const meta = ciMeta(env, git);
     const args = fitBody({ diff, files: [tree, ...pack(read, contextPaths(change.changed, change.all, git, change.rev), MAX_FILES - 1, MAX_BYTES - Buffer.byteLength(diff) - Buffer.byteLength(tree.content))], ...(Object.keys(meta).length ? { meta } : {}) });
     log(`reviewing ${change.changed.length} changed file(s) against ${change.base}`);
@@ -351,7 +371,7 @@ export async function run({ argv, env, cwd, out = (s) => process.stdout.write(s 
       const waitS = Math.min(45, Math.floor((deadline - Date.now()) / 1000) - 15);
       if (waitS < 1) throw new Deadline("timed out");
       let r = await tool("wait_review", { review_id: sub.review_id, timeout_s: waitS });
-      // A finished wait_review carries the attestation; the findings are get_findings'.
+      // The findings and review_of_record are get_findings'; a finished wait_review carries neither in full.
       if (r.status === "done" || r.status === "failed") r = await tool("get_findings", { review_id: sub.review_id });
       if (r.status === "done" || r.status === "failed") {
         const findings = (r.findings ?? []).filter((f) => f && typeof f === "object");
@@ -365,15 +385,11 @@ export async function run({ argv, env, cwd, out = (s) => process.stdout.write(s 
         if (code !== 2) out(code === 1 ? `\n${findings.filter(isBlocking).length} blocking bug(s): medium or worse.` : "\nNo blocking bugs.");
         return code;
       }
-      if (r.status === "needs_files" && r.files_url && !answered.has(r.files_url)) {
-        answered.add(r.files_url);
-        // Repository files go only to the service this run talks to.
-        if (new URL(r.files_url, api).origin !== new URL(api).origin) { log(`a file request named another host (${new URL(r.files_url, api).host}); not answered`); continue; }
-        const sent = pack(read, (r.requested_files ?? []).slice(0, 200), MAX_EXTRA, MAX_BYTES);
-        log(`the reviewers asked for ${(r.requested_files ?? []).length} file(s); sending ${sent.length}`);
-        // A refused answer is not resent: the service gives up on a file request after a few minutes and goes on.
-        try { await http(new URL(r.files_url, api).href, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(fitBody({ files: sent })) }, { upload: true }); }
-        catch (e) { if (!(e instanceof Refusal)) throw e; log(`the file answer was refused (${e.message}); continuing`); }
+      // One answer per request: the same address may serve a later request for other files.
+      const request = r.status === "needs_files" && r.files_url ? `${r.files_url} ${[...(r.requested_files ?? [])].sort().join("\0")}` : null;
+      if (request && !answered.has(request)) {
+        answered.add(request);
+        await answerFiles(r);
         continue;
       }
       if (Date.now() >= deadline) throw new Deadline("timed out");

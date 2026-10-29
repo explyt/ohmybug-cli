@@ -29,17 +29,18 @@ function repo() {
  * makes the first wait_review a file request whose answer lands in `posted`; `sse` answers as an event stream;
  * `submitStatus` fails submit_review with that HTTP status; `toolError` answers every tool call with isError;
  * `faults` fails the first call of a tool: { wait_review: 503 | "reset" | "garble" | "internal" | "rate_limited" };
- * `filesStatus` answers the file upload with that status; `filesUrl` replaces the file request's address.
+ * `filesStatus` answers the file upload with that status (a 307 goes to `filesLocation`); `filesUrl` replaces the
+ * file request's address; `requestedAgain` makes the second wait_review a second request at the same address.
  */
-async function server({ findings = [], status = "done", review_of_record = true, httpStatus = 200, requested, sse = false, submitStatus, toolError, faults = {}, filesStatus = 200, filesUrl } = {}) {
+async function server({ findings = [], status = "done", review_of_record = true, httpStatus = 200, requested, requestedAgain, sse = false, submitStatus, toolError, faults = {}, filesStatus = 200, filesUrl, filesLocation } = {}, port = 0) {
   const calls = [], posted = [];
-  let url, askedOnce = false;
+  let url, asks = 0;
   const srv = createServer((req, res) => {
     let body = "";
     req.on("data", (c) => (body += c));
     req.on("end", () => {
       if (httpStatus !== 200) { res.writeHead(httpStatus); return res.end("no"); }
-      if (req.url === "/files") { posted.push(JSON.parse(body)); res.writeHead(filesStatus); return res.end("{}"); }
+      if (req.url === "/files") { posted.push(JSON.parse(body)); res.writeHead(filesStatus, filesLocation ? { location: filesLocation } : {}); return res.end("{}"); }
       const msg = JSON.parse(body);
       const { name, arguments: args } = msg.params;
       calls.push({ name, args, auth: req.headers.authorization });
@@ -55,11 +56,11 @@ async function server({ findings = [], status = "done", review_of_record = true,
         if (fault === "garble") { res.writeHead(200, { "content-type": "application/json" }); return res.end("{\"jsonrpc\":"); }
         res.writeHead(fault); return res.end("busy");
       }
-      const asked = name === "wait_review" && requested && !askedOnce;
-      if (asked) askedOnce = true;
+      const ask = name === "wait_review" && requested ? [requested, requestedAgain][asks] : undefined;
+      if (ask) asks++;
       const result = toolError ? toolError
         : name === "submit_review" ? { review_id: "rev_test", status: "running" }
-        : asked ? { review_id: "rev_test", status: "needs_files", requested_files: requested, files_url: filesUrl ?? `${url}/files` }
+        : ask ? { review_id: "rev_test", status: "needs_files", requested_files: ask, files_url: filesUrl ?? `${url}/files` }
         : name === "wait_review" ? { review_id: "rev_test", status }
         : { review_id: "rev_test", status, findings, review_of_record, live_url: "https://example.test/live/x" };
       const answer = JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { content: [{ type: "text", text: JSON.stringify(result) }], ...(toolError ? { isError: true } : {}) } });
@@ -67,7 +68,7 @@ async function server({ findings = [], status = "done", review_of_record = true,
       res.end(sse ? `event: message\ndata: ${answer}\n\n` : answer);
     });
   });
-  await new Promise((r) => srv.listen(0, "127.0.0.1", r));
+  await new Promise((r) => srv.listen(port, "127.0.0.1", r));
   url = `http://127.0.0.1:${srv.address().port}`;
   return { url, calls, posted, close: () => new Promise((r) => srv.close(r)) };
 }
@@ -460,4 +461,76 @@ test("a host that never answers fails after four tries, not at the timeout", asy
   assert.equal(r.code, 2);
   assert.match(r.log, new RegExp(`cannot reach 127\\.0\\.0\\.1:${port} \\(ECONNREFUSED\\)`));
   assert.ok(Date.now() - t < 60_000);
+});
+
+test("file answers: a 5xx or a redirect is not fatal, a redirect is not followed, a second request at the same address is answered", async () => {
+  const { dir, git } = repo();
+  writeFileSync(join(dir, "lib.js"), "export const l = 1\n");
+  git("add", ".");
+  git("commit", "-qm", "lib");
+  writeFileSync(join(dir, "app.js"), "export const a = 19\n");
+  git("commit", "-qam", "c");
+  const busy = await server({ requested: ["app.js"], filesStatus: 503, findings: [high] });
+  try { assert.equal((await cli(dir, [], { OHMYBUG_URL: busy.url })).code, 1); } finally { await busy.close() }
+  const elsewhere = await server();
+  const moved = await server({ requested: ["app.js"], filesStatus: 307, filesLocation: `${elsewhere.url}/files` });
+  try {
+    const r = await cli(dir, [], { OHMYBUG_URL: moved.url });
+    assert.equal(r.code, 0);
+    assert.equal(elsewhere.posted.length, 0);
+    assert.match(r.log, /the file answer did not go through/);
+  } finally { await moved.close(); await elsewhere.close() }
+  const twice = await server({ requested: ["app.js"], requestedAgain: ["lib.js"] });
+  try {
+    assert.equal((await cli(dir, [], { OHMYBUG_URL: twice.url })).code, 0);
+    assert.deepEqual(twice.posted.map((p) => p.files.map((f) => f.path)), [["app.js"], ["lib.js"]]);
+  } finally { await twice.close() }
+});
+
+test("--uncommitted leaves out a nested repository inside an untracked folder", async () => {
+  const { dir } = repo();
+  mkdirSync(join(dir, "vendor", "lib"), { recursive: true });
+  execFileSync("git", ["-C", join(dir, "vendor", "lib"), "init", "-q"]);
+  writeFileSync(join(dir, "vendor", "lib", "x.js"), "1\n");
+  writeFileSync(join(dir, "vendor", "a.js"), "export const v = 1\n");
+  const s = await server();
+  try {
+    const r = await cli(dir, ["--uncommitted"], { OHMYBUG_URL: s.url });
+    assert.equal(r.code, 0, r.log);
+    const diff = s.calls.find((c) => c.name === "submit_review").args.diff;
+    assert.match(diff, /\+export const v = 1/);
+    assert.doesNotMatch(diff, /vendor\/lib/);
+  } finally { await s.close() }
+});
+
+test("a diff whose escaped size is over the cap is refused before anything is sent", async () => {
+  const { dir, git } = repo();
+  for (let i = 0; i < 60; i++) writeFileSync(join(dir, `q${i}.txt`), `${'"'.repeat(99)}\n`.repeat(1400));
+  git("add", ".");
+  git("commit", "-qm", "quotes");
+  const s = await server();
+  try {
+    const r = await cli(dir, [], { OHMYBUG_URL: s.url });
+    assert.equal(r.code, 2);
+    assert.match(r.log, /over what the service takes/);
+    assert.equal(s.calls.length, 0);
+  } finally { await s.close() }
+});
+
+test("a service that goes away mid-review is waited for: the fail-fast is only for a host never reached", async () => {
+  const { dir, git } = repo();
+  writeFileSync(join(dir, "app.js"), "export const a = 20\n");
+  git("commit", "-qam", "c");
+  const s = await server({ status: "running" });
+  const port = Number(new URL(s.url).port);
+  // Down for 25 s after the first poll: past the fourth refused try (5 s poll gap, then 2 + 4 + 8 s), where a host never reached would fail.
+  const run = cli(dir, [], { OHMYBUG_URL: s.url, OHMYBUG_TIMEOUT_S: "120" });
+  const down = (async () => {
+    while (!s.calls.some((c) => c.name === "wait_review")) await new Promise((r) => setTimeout(r, 20));
+    await s.close();
+    await new Promise((r) => setTimeout(r, 25_000));
+  })();
+  await down;
+  const again = await server({ findings: [high] }, port);
+  try { assert.equal((await run).code, 1); } finally { await again.close() }
 });

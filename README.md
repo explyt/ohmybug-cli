@@ -35,7 +35,7 @@ The CLI prints each finding (severity, file:line, title, failure scenario) and a
 | Exit code | Meaning |
 |---|---|
 | 0 | no medium or worse bug (lows are printed, and do not fail the job) |
-| 1 | at least one medium or worse bug |
+| 1 | at least one medium or worse bug, or a finding whose severity the CLI does not know (the gate fails closed) |
 | 2 | the review could not run: no key, a refused key, network, a failed review, or a run cut short with no medium or worse bug (lows found by a cut-short run do not make it clean) |
 
 | Variable | Default | |
@@ -60,7 +60,7 @@ ohmybug:
     GIT_DEPTH: 0
   script:
     - git fetch origin "$CI_MERGE_REQUEST_TARGET_BRANCH_NAME"
-    - curl -fsSL https://raw.githubusercontent.com/explyt/ohmybug-cli/main/install.sh | sh
+    - curl -fsSL https://raw.githubusercontent.com/explyt/ohmybug-cli/v0.1.0/install.sh | OHMYBUG_CLI_URL=https://raw.githubusercontent.com/explyt/ohmybug-cli/v0.1.0/ohmybug.mjs sh
     - ohmybug
 ```
 
@@ -79,13 +79,13 @@ pipelines:
           script:
             # The clone tracks one branch: name where the target goes, or origin/<target> does not exist.
             - git fetch origin "+refs/heads/$BITBUCKET_PR_DESTINATION_BRANCH:refs/remotes/origin/$BITBUCKET_PR_DESTINATION_BRANCH"
-            - curl -fsSL https://raw.githubusercontent.com/explyt/ohmybug-cli/main/install.sh | sh
+            - curl -fsSL https://raw.githubusercontent.com/explyt/ohmybug-cli/v0.1.0/install.sh | OHMYBUG_CLI_URL=https://raw.githubusercontent.com/explyt/ohmybug-cli/v0.1.0/ohmybug.mjs sh
             - ohmybug --base "origin/$BITBUCKET_PR_DESTINATION_BRANCH"
 ```
 
 ## What is sent
 
-The diff (when it is over 2 MiB, per-file entries over 160 KiB, such as lockfiles and generated files, are left out and the run says so), the list of file paths at the reviewed head, and up to 29 related files (the changed files, the project manifests, and files that mention a changed module). During the review the reviewers may ask for more files by path. Every file sent is read from the reviewed commit; with `--uncommitted`, from a snapshot of the working tree taken at the start (untracked files included, nested repositories left out), so edits made while the review runs do not reach it. Ignored files, anything under `.git` and anything outside the repository are never sent. With the review go the branch name and, in a GitLab merge request pipeline, the merge request title and description.
+The diff (when it is over 2 MiB, per-file entries over 160 KiB, such as lockfiles and generated files, are left out and the run says so), the list of file paths at the reviewed head, and up to 29 related files (the changed files, the project manifests, and files that mention a changed module). During the review the reviewers may ask for more files by path. Every file sent is read from the reviewed commit; with `--uncommitted`, from a snapshot of the working tree taken at the start (untracked files included, nested repositories left out), so edits made while the review runs do not reach it. Only files of the reviewed tree are sent: untracked ignored files, anything under `.git` and anything outside the repository never are (a file committed to the repository is part of it, ignored or not). File requests are answered only to the service's own address, and redirects are not followed. With the review go the branch name and, in a GitLab merge request pipeline, the merge request title and description.
 
 ## Develop
 
