@@ -651,8 +651,10 @@ test("--deep sends the pushed commit's coordinates and no payload; refuses what 
     [() => {}, {}, [], /needs a GitHub repository/],
     [() => git("remote", "add", "origin", "https://git.example.com/github.com/acme/app.git"), {}, [], /needs a GitHub repository/],
     [() => git("remote", "set-url", "origin", "git@github.com:acme/app.git"), {}, [], /push it first/],
+    [() => git("update-ref", "refs/remotes/fork/feature", "HEAD"), { GITHUB_SHA: "0".repeat(40) }, [], /push it first/],
     [() => git("update-ref", "refs/remotes/origin/feature", "HEAD"), { GITHUB_SERVER_URL: "https://ghe.example.com" }, [], /not on https:\/\/ghe/],
     [() => {}, {}, ["--base", head.slice(0, 12)], /base as a branch name/],
+    [() => {}, {}, ["--base", "HEAD~1"], /base as a branch name/],
   ]) {
     setup();
     const s = await server();
@@ -675,13 +677,16 @@ test("--deep sends the pushed commit's coordinates and no payload; refuses what 
     assert.equal(target(s), `acme/app ${head} main`);
     assert.match(r.log, /waiting up to 7200s/);
   } finally { await s.close() }
-  // An https origin; Actions' base branch; --base wins over it; GITHUB_REPOSITORY wins over the remote.
+  // An https origin; Actions' base branch; --base wins over it; the origin wins over GITHUB_REPOSITORY, which is only
+  // the fallback; in Actions GITHUB_SHA stands for the push.
   git("remote", "set-url", "origin", "https://github.com/acme/web");
-  for (const [env, argv, want] of [
-    [{ GITHUB_BASE_REF: "develop" }, [], `acme/web ${head} develop`],
-    [{ GITHUB_BASE_REF: "develop" }, ["--base", "origin/release"], `acme/web ${head} release`],
-    [{ GITHUB_REPOSITORY: "acme/other", GITHUB_SHA: head }, [], `acme/other ${head} main`],
+  for (const [setup, env, argv, want] of [
+    [() => {}, { GITHUB_BASE_REF: "develop", GITHUB_SERVER_URL: "https://github.com" }, [], `acme/web ${head} develop`],
+    [() => {}, { GITHUB_BASE_REF: "develop" }, ["--base", "origin/release"], `acme/web ${head} release`],
+    [() => git("update-ref", "-d", "refs/remotes/origin/feature"), { GITHUB_REPOSITORY: "acme/other", GITHUB_SHA: head }, [], `acme/web ${head} main`],
+    [() => git("remote", "remove", "origin"), { GITHUB_REPOSITORY: "acme/other", GITHUB_SHA: head }, [], `acme/other ${head} main`],
   ]) {
+    setup();
     const s = await server();
     try {
       const r = await cli(dir, ["--deep", ...argv], { OHMYBUG_URL: s.url, ...env });
@@ -692,7 +697,7 @@ test("--deep sends the pushed commit's coordinates and no payload; refuses what 
   // The service turning the deep hunt down is a refusal: exit 2, its words, nothing polled.
   const busy = await server({ toolError: { error: "deep_at_capacity", message: "The deep hunt is not available right now." } });
   try {
-    const r = await cli(dir, ["--deep"], { OHMYBUG_URL: busy.url });
+    const r = await cli(dir, ["--deep"], { OHMYBUG_URL: busy.url, GITHUB_REPOSITORY: "acme/other", GITHUB_SHA: head });
     assert.equal(r.code, 2);
     assert.match(r.log, /deep_at_capacity: The deep hunt is not available right now/);
     assert.equal(busy.calls.filter((c) => c.name === "submit_review").length, 1);

@@ -14,11 +14,11 @@ const USAGE = `ohmybug ${VERSION}: review this repository's changes with OhMyBug
 Usage:
   ohmybug [--base <ref>]     review <base>...HEAD (the committed changes of this branch)
   ohmybug --uncommitted      review the working tree against HEAD, untracked files included
-  ohmybug --deep [--base <ref>]  the deep hunt of the pushed HEAD commit (GitHub only): the service reads the
+  ohmybug --deep [--base <branch>]  the deep hunt of the pushed HEAD commit (GitHub only): the service reads the
                              whole repository; about an hour, so OHMYBUG_TIMEOUT_S defaults to 7200
 
 The base is --base, else $CI_MERGE_REQUEST_TARGET_BRANCH_NAME (GitLab merge request pipelines),
-else origin/main.
+else origin/main. With --deep it is a branch name: --base, else $GITHUB_BASE_REF, else main.
 
 Environment:
   OHMYBUG_API_KEY     required: a key from https://ohmybug.ai/me
@@ -231,22 +231,20 @@ export function rpcMessage(text) {
 
 /**
  * Where the deep hunt finds the change, read from git and the environment only (no local diff: a shallow CI clone
- * has no base): the github.com repository (GITHUB_REPOSITORY, else the origin remote), the pushed HEAD commit and
- * the base branch. The service reads a public repository, or one with the OhMyBug App installed.
+ * has no base): the github.com repository (the origin remote, which is the checkout's own, else GITHUB_REPOSITORY),
+ * the pushed HEAD commit and the base branch. The service reads a public repository, or one with the OhMyBug App installed.
  */
 export function deepTarget(opts, env, git) {
   const server = env.GITHUB_SERVER_URL;
   if (server && !/^https:\/\/github\.com\/?$/.test(server)) throw new Refusal(`--deep reads repositories on github.com, not on ${server}`);
-  let repo = /^[\w.-]+\/[\w.-]+$/.test(env.GITHUB_REPOSITORY ?? "") ? env.GITHUB_REPOSITORY : "";
-  if (!repo) {
-    let url = "";
-    try { url = git("remote", "get-url", "origin").trim(); } catch {}
-    repo = url.match(/^(?:[\w.+-]+:\/\/)?(?:[^@/]+@)?github\.com[:/]([\w.-]+\/[\w.-]+?)(?:\.git)?\/?$/)?.[1] ?? "";
-  }
-  if (!repo) throw new Refusal("--deep needs a GitHub repository: set GITHUB_REPOSITORY=owner/name, or an origin remote on github.com");
+  let url = "";
+  try { url = git("remote", "get-url", "origin").trim(); } catch {}
+  let repo = url.match(/^(?:[\w.+-]+:\/\/)?(?:[^@/]+@)?github\.com[:/]([\w.-]+\/[\w.-]+?)(?:\.git)?\/?$/)?.[1] ?? "";
+  if (!repo && /^[\w.-]+\/[\w.-]+$/.test(env.GITHUB_REPOSITORY ?? "")) repo = env.GITHUB_REPOSITORY;
+  if (!repo) throw new Refusal("--deep needs a GitHub repository: an origin remote on github.com, or GITHUB_REPOSITORY=owner/name");
   const ref = git("rev-parse", "HEAD").trim();
-  // In Actions the checked-out commit is GitHub's own; elsewhere a remote branch must hold it, or the service cannot.
-  if (!env.GITHUB_SHA && !git("branch", "-r", "--contains", ref).trim()) throw new Refusal("--deep reviews a pushed commit: no remote branch holds HEAD; push it first");
+  // In Actions the checked-out commit GITHUB_SHA is GitHub's own; any other HEAD must be on an origin branch.
+  if (ref !== env.GITHUB_SHA && !git("branch", "-r", "--list", "origin/*", "--contains", ref).trim()) throw new Refusal("--deep reviews a pushed commit: no remote branch holds HEAD; push it first");
   const base = (opts.base || env.GITHUB_BASE_REF || "main").replace(/^(refs\/remotes\/)?origin\//, "");
   if (/^[0-9a-f]{7,40}$/i.test(base) || /[~^:\s]|\.\./.test(base)) throw new Refusal(`--deep needs the base as a branch name, not ${base}`);
   return { repo, ref, base_branch: base };
