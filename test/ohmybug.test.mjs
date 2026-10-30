@@ -3,7 +3,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, writeFileSync, mkdirSync, symlinkSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync, mkdirSync, symlinkSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -34,15 +34,24 @@ function repo() {
  * `filesStatus` answers the file upload with that status, or with each of a list in turn (a 307 goes to
  * `filesLocation`); `filesUrl` replaces the
  * file request's address; `requestedAgain` makes the second wait_review a second request at the same address.
+ * A submit_review with `upload` gets a ticket: the tree lands in `snapshots` (answered with `snapshotStatus`), and
+ * the {diff, files} post merges into that call's args, so `.args.diff` reads the same either way.
  */
-async function server({ findings = [], status = "done", review_of_record = true, httpStatus = 200, requested, requestedAgain, sse = false, submitStatus, toolError, faults = {}, filesStatus = 200, filesUrl, filesLocation } = {}, port = 0) {
-  const calls = [], posted = [];
+async function server({ findings = [], status = "done", review_of_record = true, httpStatus = 200, requested, requestedAgain, sse = false, submitStatus, toolError, faults = {}, filesStatus = 200, filesUrl, filesLocation, snapshotStatus = 200 } = {}, port = 0) {
+  const calls = [], posted = [], snapshots = [];
   let url, asks = 0;
   const srv = createServer((req, res) => {
-    let body = "";
-    req.on("data", (c) => (body += c));
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
     req.on("end", () => {
+      const body = Buffer.concat(chunks).toString();
       if (httpStatus !== 200) { res.writeHead(httpStatus); return res.end("no"); }
+      if (req.url === "/up/rev_test/repo") { snapshots.push(Buffer.concat(chunks)); res.writeHead(snapshotStatus); return res.end(JSON.stringify({ snapshot_bytes: 1 })); }
+      if (req.url === "/up/rev_test") {
+        Object.assign(calls.find((c) => c.name === "submit_review").args, JSON.parse(body));
+        res.writeHead(200, { "content-type": "application/json" });
+        return res.end(JSON.stringify({ status: "running" }));
+      }
       if (req.url === "/files") {
         posted.push(JSON.parse(body));
         res.writeHead(Array.isArray(filesStatus) ? filesStatus[posted.length - 1] ?? 200 : filesStatus, filesLocation ? { location: filesLocation } : {});
@@ -73,7 +82,7 @@ async function server({ findings = [], status = "done", review_of_record = true,
       const ask = name === "wait_review" && requested ? [requested, requestedAgain][asks] : undefined;
       if (ask) asks++;
       const result = toolError ? toolError
-        : name === "submit_review" ? { review_id: "rev_test", status: "running" }
+        : name === "submit_review" ? (args.upload ? { review_id: "rev_test", status: "awaiting_upload", upload_url: `${url}/up/rev_test` } : { review_id: "rev_test", status: "running" })
         : ask ? { review_id: "rev_test", status: "needs_files", requested_files: ask, files_url: filesUrl ?? `${url}/files` }
         : name === "wait_review" ? { review_id: "rev_test", status }
         : { review_id: "rev_test", status, findings, review_of_record, live_url: "https://example.test/live/x" };
@@ -86,7 +95,7 @@ async function server({ findings = [], status = "done", review_of_record = true,
   srv.keepAliveTimeout = 60_000;
   await new Promise((r) => srv.listen(port, "127.0.0.1", r));
   url = `http://127.0.0.1:${srv.address().port}`;
-  return { url, calls, posted, close: () => new Promise((r) => { srv.close(r); srv.closeIdleConnections?.(); }) };
+  return { url, calls, posted, snapshots, close: () => new Promise((r) => { srv.close(r); srv.closeIdleConnections?.(); }) };
 }
 
 async function cli(dir, argv, env) {
@@ -102,7 +111,8 @@ test("parseArgs refuses unknown flags and --base with --uncommitted", () => {
   assert.equal(typeof parseArgs(["--nope"]), "string");
   assert.equal(typeof parseArgs(["--base"]), "string");
   assert.equal(typeof parseArgs(["--base", "x", "--uncommitted"]), "string");
-  assert.deepEqual(parseArgs(["--base=dev"]), { base: "dev", uncommitted: false, help: false, version: false });
+  assert.deepEqual(parseArgs(["--base=dev"]), { base: "dev", uncommitted: false, snapshot: true, help: false, version: false });
+  assert.equal(parseArgs(["--no-snapshot"]).snapshot, false);
 });
 
 test("the base: --base, then the merge request target (remote-tracking when present), then origin/main", () => {
@@ -631,5 +641,50 @@ test("a file over 512 KiB is not sent, as context or on request", async () => {
   try {
     assert.equal((await cli(dir, [], { OHMYBUG_URL: s.url })).code, 0);
     assert.deepEqual(s.posted[0].files.map((f) => f.path), ["app.js"]);
+  } finally { await s.close() }
+});
+
+test("the reviewed tree goes up as a snapshot before the payload; --no-snapshot sends the payload alone", async () => {
+  const { dir, git } = repo();
+  writeFileSync(join(dir, "huge.bin.txt"), "h".repeat(1100 * 1024) + "\n");
+  git("add", ".");
+  git("commit", "-qm", "huge");
+  git("update-ref", "refs/remotes/origin/main", "HEAD");
+  writeFileSync(join(dir, "app.js"), "export const a = 26\n");
+  git("commit", "-qam", "c");
+  writeFileSync(join(dir, "app.js"), "export const a = 27 // not committed, not in the snapshot\n");
+  const s = await server({ findings: [high] });
+  try {
+    const r = await cli(dir, [], { OHMYBUG_URL: s.url });
+    assert.equal(r.code, 1);
+    const submit = s.calls.find((c) => c.name === "submit_review");
+    assert.equal(submit.args.upload, true);
+    assert.match(submit.args.diff, /\+export const a = 26/);
+    assert.equal(s.snapshots.length, 1);
+    const dirOut = mkdtempSync(join(tmpdir(), "ohmybug-snap-"));
+    writeFileSync(join(dirOut, "s.tgz"), s.snapshots[0]);
+    execFileSync("tar", ["-xzf", "s.tgz"], { cwd: dirOut });
+    assert.equal(readFileSync(join(dirOut, "app.js"), "utf8"), "export const a = 26\n");
+    // An untouched blob over 1 MiB stays out of the snapshot.
+    assert.equal(existsSync(join(dirOut, "huge.bin.txt")), false);
+  } finally { await s.close() }
+  const plain = await server();
+  try {
+    assert.equal((await cli(dir, ["--no-snapshot"], { OHMYBUG_URL: plain.url })).code, 0);
+    assert.equal(plain.snapshots.length, 0);
+    assert.equal(plain.calls.find((c) => c.name === "submit_review").args.upload, undefined);
+  } finally { await plain.close() }
+});
+
+test("a refused snapshot still starts the hunt on the diff and files", async () => {
+  const { dir, git } = repo();
+  writeFileSync(join(dir, "app.js"), "export const a = 28\n");
+  git("commit", "-qam", "c");
+  const s = await server({ snapshotStatus: 413, findings: [high] });
+  try {
+    const r = await cli(dir, [], { OHMYBUG_URL: s.url });
+    assert.equal(r.code, 1);
+    assert.match(r.log, /snapshot was refused \(HTTP 413\)/);
+    assert.match(s.calls.find((c) => c.name === "submit_review").args.diff, /\+export const a = 28/);
   } finally { await s.close() }
 });

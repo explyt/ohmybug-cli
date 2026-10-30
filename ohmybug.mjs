@@ -8,12 +8,13 @@ import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { pathToFileURL } from "node:url";
 
-export const VERSION = "0.1.0";
+export const VERSION = "0.2.0";
 const USAGE = `ohmybug ${VERSION}: review this repository's changes with OhMyBug.
 
 Usage:
   ohmybug [--base <ref>]     review <base>...HEAD (the committed changes of this branch)
   ohmybug --uncommitted      review the working tree against HEAD, untracked files included
+  --no-snapshot              send only the diff and related files, not the reviewed tree (a slower, weaker hunt)
 
 The base is --base, else $CI_MERGE_REQUEST_TARGET_BRANCH_NAME (GitLab merge request pipelines),
 else origin/main.
@@ -39,6 +40,8 @@ const POLL_ROOM = 20_000;
 // Server caps: 30 files and about 10 MiB of diff and files per call; 20 files per answer to a file request.
 const MAX_FILES = 30, MAX_EXTRA = 20, MAX_BYTES = 9 * 1024 * 1024, MAX_BODY = 11_500_000, MAX_FILE = 512 * 1024;
 const MAX_TREE = 1024 * 1024;
+// The repository snapshot: the server's ceiling, and the untouched blobs left out of it (media, recordings).
+const MAX_SNAPSHOT = 128 * 1024 * 1024, SNAPSHOT_MAX_FILE = 1024 * 1024;
 // Pinned diff format, whatever the user's git config says (noprefix, mnemonicPrefix, textconv drivers).
 const DIFF_FLAGS = ["--no-color", "--no-ext-diff", "--no-textconv", "--src-prefix=a/", "--dst-prefix=b/"];
 const TRANSIENT_TOOL = new Set(["internal", "rate_limited"]);
@@ -48,10 +51,11 @@ export class Deadline extends Error {}
 
 /** argv → options, or a string to print and exit 2 on. */
 export function parseArgs(argv) {
-  const o = { base: undefined, uncommitted: false, help: false, version: false };
+  const o = { base: undefined, uncommitted: false, snapshot: true, help: false, version: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--uncommitted") o.uncommitted = true;
+    else if (a === "--no-snapshot") o.snapshot = false;
     else if (a === "--help" || a === "-h") o.help = true;
     else if (a === "--version") o.version = true;
     else if (a === "--base") { if (!argv[i + 1] || argv[i + 1].startsWith("-")) return "--base needs a ref"; o.base = argv[++i]; }
@@ -97,6 +101,19 @@ export function selectChange(opts, env, git, snapshot) {
   const changed = git("diff", ...range, "--name-only", "--diff-filter=d", "-z").split("\0").filter(Boolean);
   const all = git("ls-tree", "-r", "--name-only", "-z", rev).split("\0").filter(Boolean);
   return { diff, changed, all, rev, base };
+}
+
+/** The reviewed tree as a tar.gz, without the blobs over SNAPSHOT_MAX_FILE the diff does not touch. */
+function snapshotArchive(change, git, gitBuf) {
+  const touched = new Set(change.changed), big = [];
+  for (const rec of git("ls-tree", "-r", "-l", "-z", change.rev).split("\0")) {
+    const tab = rec.indexOf("\t");
+    if (tab < 0) continue;
+    const size = Number(rec.slice(0, tab).trim().split(/\s+/)[3]); // "-" for a submodule: NaN, kept
+    if (size > SNAPSHOT_MAX_FILE && !touched.has(rec.slice(tab + 1))) big.push(rec.slice(tab + 1));
+  }
+  // shortcut: one argv pathspec per left-out file; fine for hundreds, tens of thousands of big blobs would hit ARG_MAX.
+  return gitBuf("-c", "core.autocrlf=false", "archive", "--format=tar.gz", change.rev, ...(big.length ? ["--", ".", ...big.map((p) => `:(exclude,literal)${p}`)] : []));
 }
 
 /**
@@ -354,6 +371,35 @@ export async function run({ argv, env, cwd, out = (s) => process.stdout.write(s 
     return false;
   }
 
+  /**
+   * The hunt with the reviewed tree as its repository (input/repo), as the service's fast pair needs: an upload
+   * ticket, the tree as a tar.gz, then {diff, files}, which starts the hunt. Nothing starts before that last post,
+   * so a refused or failed snapshot only means the hunt runs on the diff and files alone.
+   */
+  async function submitWithSnapshot({ meta, ...payload }, change, git, gitBuf) {
+    const t = await tool("submit_review", { upload: true, ...(meta ? { meta } : {}) }, true);
+    if (!t.review_id || !t.upload_url) throw new Refusal(`submit_review gave no upload ticket: ${JSON.stringify(t).slice(0, 300)}`);
+    let up;
+    try { up = new URL(t.upload_url, api); } catch { throw new Refusal("the upload ticket named no usable address; nothing was sent"); }
+    if (up.origin !== apiUrl.origin) throw new Refusal(`the upload ticket named another host (${up.host}); nothing was sent`);
+    const tgz = snapshotArchive(change, git, gitBuf);
+    if (tgz.length > MAX_SNAPSHOT) log(`the repository snapshot is ${tgz.length} bytes, over ${MAX_SNAPSHOT}: the hunt runs on the diff and files alone`);
+    else {
+      try {
+        const res = await fetch(`${up.href}/repo`, {
+          method: "POST", headers: { "content-type": "application/gzip" }, body: tgz, redirect: "error",
+          signal: AbortSignal.timeout(Math.max(1, deadline - Date.now() - POLL_ROOM)),
+        });
+        if (res.ok) log(`repository snapshot sent (${tgz.length} bytes)`);
+        else log(`the repository snapshot was refused (HTTP ${res.status}): the hunt runs on the diff and files alone`);
+      } catch (e) { log(`the repository snapshot did not go through (${e.cause?.code ?? e.message}): the hunt runs on the diff and files alone`); }
+    }
+    const text = await http(up.href, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(payload) }, { once: true });
+    let r = {};
+    try { r = JSON.parse(text) } catch {}
+    return { ...r, ...t };
+  }
+
   let started, read;
   try {
     let root;
@@ -380,7 +426,7 @@ export async function run({ argv, env, cwd, out = (s) => process.stdout.write(s 
     const args = fitBody({ diff, files: [tree, ...pack(read, contextPaths(change.changed, change.all, git, change.rev), MAX_FILES - 1, MAX_BYTES - Buffer.byteLength(diff) - Buffer.byteLength(tree.content))], ...(Object.keys(meta).length ? { meta } : {}) });
     log(`reviewing ${change.changed.length} changed file(s) against ${change.base}`);
 
-    const sub = await tool("submit_review", args, true);
+    const sub = opts.snapshot ? await submitWithSnapshot(args, change, git, gitBuf) : await tool("submit_review", args, true);
     if (!sub.review_id) throw new Refusal(`submit_review answered without a review id: ${JSON.stringify(sub).slice(0, 300)}. ${MAYBE_STARTED}`);
     started = sub;
     log(`review ${sub.review_id} started${sub.recent_median_minutes ? `; recent ones took about ${sub.recent_median_minutes} min` : ""}`);
