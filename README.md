@@ -26,6 +26,7 @@ Create an API key at [ohmybug.ai/me](https://ohmybug.ai/me) and put it in `OHMYB
 ohmybug                  # review <base>...HEAD: the commits of this branch
 ohmybug --base develop   # the same against another base
 ohmybug --uncommitted    # review the working tree against HEAD, untracked files included (not ignored ones)
+ohmybug --deep           # the deep hunt of the pushed HEAD (GitHub, public or with the OhMyBug App): the service reads the whole repository; about an hour
 ```
 
 The base is `--base`, else `$CI_MERGE_REQUEST_TARGET_BRANCH_NAME` (GitLab merge request pipelines), else `origin/main`. The CI clone must contain the base: fetch it, or clone with enough depth.
@@ -41,7 +42,7 @@ The CLI prints each finding (severity, file:line, title, failure scenario) and a
 | Variable | Default | |
 |---|---|---|
 | `OHMYBUG_API_KEY` | required | your key |
-| `OHMYBUG_TIMEOUT_S` | `1800` | how long to wait for the review, 30 to 86400 seconds |
+| `OHMYBUG_TIMEOUT_S` | `1800` (`7200` with `--deep`) | how long to wait for the review, 30 to 86400 seconds |
 | `OHMYBUG_URL` | `https://mcp.ohmybug.ai` | the service |
 
 ## Billing

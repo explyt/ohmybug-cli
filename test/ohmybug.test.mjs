@@ -106,7 +106,8 @@ test("parseArgs refuses unknown flags and --base with --uncommitted", () => {
   assert.equal(typeof parseArgs(["--nope"]), "string");
   assert.equal(typeof parseArgs(["--base"]), "string");
   assert.equal(typeof parseArgs(["--base", "x", "--uncommitted"]), "string");
-  assert.deepEqual(parseArgs(["--base=dev"]), { base: "dev", uncommitted: false, help: false, version: false });
+  assert.deepEqual(parseArgs(["--base=dev"]), { base: "dev", uncommitted: false, deep: false, help: false, version: false });
+  assert.equal(typeof parseArgs(["--deep", "--uncommitted"]), "string");
 });
 
 test("the base: --base, then the merge request target (remote-tracking when present), then origin/main", () => {
@@ -636,4 +637,45 @@ test("a file over 512 KiB is not sent, as context or on request", async () => {
     assert.equal((await cli(dir, [], { OHMYBUG_URL: s.url })).code, 0);
     assert.deepEqual(s.posted[0].files.map((f) => f.path), ["app.js"]);
   } finally { await s.close() }
+});
+
+test("--deep sends the pushed commit's coordinates and no payload; refuses with no GitHub repository; a refusal starts nothing", async () => {
+  const { dir, git } = repo();
+  writeFileSync(join(dir, "app.js"), "export const a = 40\n");
+  git("commit", "-qam", "c");
+  const head = git("rev-parse", "HEAD").trim();
+  // No GitHub remote and no GITHUB_REPOSITORY: refused before any call.
+  const none = await server();
+  try {
+    const r = await cli(dir, ["--deep"], { OHMYBUG_URL: none.url });
+    assert.equal(r.code, 2);
+    assert.match(r.log, /--deep needs a GitHub repository/);
+    assert.equal(none.calls.length, 0);
+  } finally { await none.close() }
+  git("remote", "add", "origin", "git@github.com:acme/app.git");
+  const s = await server({ findings: [high] });
+  try {
+    const r = await cli(dir, ["--deep"], { OHMYBUG_URL: s.url });
+    assert.equal(r.code, 1, r.log);
+    const sub = s.calls.find((c) => c.name === "submit_review").args;
+    assert.equal(sub.deep, true);
+    assert.equal(sub.diff, undefined);
+    assert.equal(sub.files, undefined);
+    assert.deepEqual({ repo: sub.meta.repo, ref: sub.meta.ref, base_branch: sub.meta.base_branch }, { repo: "acme/app", ref: head, base_branch: "main" });
+  } finally { await s.close() }
+  // GITHUB_REPOSITORY wins over the remote.
+  const gh = await server();
+  try {
+    await cli(dir, ["--deep"], { OHMYBUG_URL: gh.url, GITHUB_REPOSITORY: "acme/other" });
+    assert.equal(gh.calls.find((c) => c.name === "submit_review").args.meta.repo, "acme/other");
+  } finally { await gh.close() }
+  // The service turning the deep hunt down is a refusal: exit 2, its words, nothing polled.
+  const busy = await server({ toolError: { error: "deep_at_capacity", message: "The deep hunt is not available right now." } });
+  try {
+    const r = await cli(dir, ["--deep"], { OHMYBUG_URL: busy.url });
+    assert.equal(r.code, 2);
+    assert.match(r.log, /deep_at_capacity: The deep hunt is not available right now/);
+    assert.equal(busy.calls.filter((c) => c.name === "submit_review").length, 1);
+    assert.equal(busy.calls.filter((c) => c.name !== "submit_review").length, 0);
+  } finally { await busy.close() }
 });
