@@ -639,36 +639,56 @@ test("a file over 512 KiB is not sent, as context or on request", async () => {
   } finally { await s.close() }
 });
 
-test("--deep sends the pushed commit's coordinates and no payload; refuses with no GitHub repository; a refusal starts nothing", async () => {
+test("--deep sends the pushed commit's coordinates and no payload; refuses what the service could not read; a refusal starts nothing", async () => {
   const { dir, git } = repo();
   writeFileSync(join(dir, "app.js"), "export const a = 40\n");
   git("commit", "-qam", "c");
   const head = git("rev-parse", "HEAD").trim();
-  // No GitHub remote and no GITHUB_REPOSITORY: refused before any call.
-  const none = await server();
-  try {
-    const r = await cli(dir, ["--deep"], { OHMYBUG_URL: none.url });
-    assert.equal(r.code, 2);
-    assert.match(r.log, /--deep needs a GitHub repository/);
-    assert.equal(none.calls.length, 0);
-  } finally { await none.close() }
-  git("remote", "add", "origin", "git@github.com:acme/app.git");
+  const target = (s) => { const m = s.calls.find((c) => c.name === "submit_review")?.args.meta; return m && [m.repo, m.ref, m.base_branch].join(" ") };
+  // Refused before any call: no GitHub repository, a remote that only mentions github.com, an unpushed HEAD,
+  // GitHub Enterprise, a base that is not a branch name.
+  for (const [setup, env, argv, why] of [
+    [() => {}, {}, [], /needs a GitHub repository/],
+    [() => git("remote", "add", "origin", "https://git.example.com/github.com/acme/app.git"), {}, [], /needs a GitHub repository/],
+    [() => git("remote", "set-url", "origin", "git@github.com:acme/app.git"), {}, [], /push it first/],
+    [() => git("update-ref", "refs/remotes/origin/feature", "HEAD"), { GITHUB_SERVER_URL: "https://ghe.example.com" }, [], /not on https:\/\/ghe/],
+    [() => {}, {}, ["--base", head.slice(0, 12)], /base as a branch name/],
+  ]) {
+    setup();
+    const s = await server();
+    try {
+      const r = await cli(dir, ["--deep", ...argv], { OHMYBUG_URL: s.url, ...env });
+      assert.equal(r.code, 2, r.log);
+      assert.match(r.log, why);
+      assert.equal(s.calls.length, 0);
+    } finally { await s.close() }
+  }
+  // Pushed, ssh origin: the coordinates and nothing else; the deep budget is 7200 s unless set.
   const s = await server({ findings: [high] });
   try {
-    const r = await cli(dir, ["--deep"], { OHMYBUG_URL: s.url });
+    const r = await cli(dir, ["--deep"], { OHMYBUG_URL: s.url, OHMYBUG_TIMEOUT_S: undefined });
     assert.equal(r.code, 1, r.log);
     const sub = s.calls.find((c) => c.name === "submit_review").args;
     assert.equal(sub.deep, true);
     assert.equal(sub.diff, undefined);
     assert.equal(sub.files, undefined);
-    assert.deepEqual({ repo: sub.meta.repo, ref: sub.meta.ref, base_branch: sub.meta.base_branch }, { repo: "acme/app", ref: head, base_branch: "main" });
+    assert.equal(target(s), `acme/app ${head} main`);
+    assert.match(r.log, /waiting up to 7200s/);
   } finally { await s.close() }
-  // GITHUB_REPOSITORY wins over the remote.
-  const gh = await server();
-  try {
-    await cli(dir, ["--deep"], { OHMYBUG_URL: gh.url, GITHUB_REPOSITORY: "acme/other" });
-    assert.equal(gh.calls.find((c) => c.name === "submit_review").args.meta.repo, "acme/other");
-  } finally { await gh.close() }
+  // An https origin; Actions' base branch; --base wins over it; GITHUB_REPOSITORY wins over the remote.
+  git("remote", "set-url", "origin", "https://github.com/acme/web");
+  for (const [env, argv, want] of [
+    [{ GITHUB_BASE_REF: "develop" }, [], `acme/web ${head} develop`],
+    [{ GITHUB_BASE_REF: "develop" }, ["--base", "origin/release"], `acme/web ${head} release`],
+    [{ GITHUB_REPOSITORY: "acme/other", GITHUB_SHA: head }, [], `acme/other ${head} main`],
+  ]) {
+    const s = await server();
+    try {
+      const r = await cli(dir, ["--deep", ...argv], { OHMYBUG_URL: s.url, ...env });
+      assert.equal(r.code, 0, r.log);
+      assert.equal(target(s), want);
+    } finally { await s.close() }
+  }
   // The service turning the deep hunt down is a refusal: exit 2, its words, nothing polled.
   const busy = await server({ toolError: { error: "deep_at_capacity", message: "The deep hunt is not available right now." } });
   try {

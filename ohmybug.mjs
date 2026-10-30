@@ -187,7 +187,7 @@ function contextPaths(changed, all, git, rev) {
   return [...changed, ...roots, ...[...hits].sort((a, b) => b[1] - a[1]).map(([p]) => p)];
 }
 
-/** What the CI says about the change, as the server's optional labels; never repo or ref, so the server reads no host. */
+/** What the CI says about the change, as the server's optional labels; never repo or ref, so the server reads no host (only --deep adds them, deepTarget). */
 export function ciMeta(env, git) {
   const cut = (v, n) => (typeof v === "string" ? v.slice(0, n).trim() : "");
   let branch = cut(env.CI_MERGE_REQUEST_SOURCE_BRANCH_NAME || env.CI_COMMIT_REF_NAME || env.BITBUCKET_BRANCH, 200);
@@ -230,18 +230,26 @@ export function rpcMessage(text) {
 }
 
 /**
- * Where the deep hunt finds the change: the GitHub repository (GITHUB_REPOSITORY, else a github.com origin), the
- * HEAD commit and the base branch. The service reads a public repository, or one with the OhMyBug App installed.
+ * Where the deep hunt finds the change, read from git and the environment only (no local diff: a shallow CI clone
+ * has no base): the github.com repository (GITHUB_REPOSITORY, else the origin remote), the pushed HEAD commit and
+ * the base branch. The service reads a public repository, or one with the OhMyBug App installed.
  */
-export function deepTarget(env, git, base) {
+export function deepTarget(opts, env, git) {
+  const server = env.GITHUB_SERVER_URL;
+  if (server && !/^https:\/\/github\.com\/?$/.test(server)) throw new Refusal(`--deep reads repositories on github.com, not on ${server}`);
   let repo = /^[\w.-]+\/[\w.-]+$/.test(env.GITHUB_REPOSITORY ?? "") ? env.GITHUB_REPOSITORY : "";
   if (!repo) {
     let url = "";
     try { url = git("remote", "get-url", "origin").trim(); } catch {}
-    repo = url.match(/github\.com[:/]([\w.-]+\/[\w.-]+?)(?:\.git)?\/?$/)?.[1] ?? "";
+    repo = url.match(/^(?:[\w.+-]+:\/\/)?(?:[^@/]+@)?github\.com[:/]([\w.-]+\/[\w.-]+?)(?:\.git)?\/?$/)?.[1] ?? "";
   }
   if (!repo) throw new Refusal("--deep needs a GitHub repository: set GITHUB_REPOSITORY=owner/name, or an origin remote on github.com");
-  return { repo, ref: git("rev-parse", "HEAD").trim(), base_branch: base.replace(/^(refs\/remotes\/)?origin\//, "") };
+  const ref = git("rev-parse", "HEAD").trim();
+  // In Actions the checked-out commit is GitHub's own; elsewhere a remote branch must hold it, or the service cannot.
+  if (!env.GITHUB_SHA && !git("branch", "-r", "--contains", ref).trim()) throw new Refusal("--deep reviews a pushed commit: no remote branch holds HEAD; push it first");
+  const base = (opts.base || env.GITHUB_BASE_REF || "main").replace(/^(refs\/remotes\/)?origin\//, "");
+  if (/^[0-9a-f]{7,40}$/i.test(base) || /[~^:\s]|\.\./.test(base)) throw new Refusal(`--deep needs the base as a branch name, not ${base}`);
+  return { repo, ref, base_branch: base };
 }
 
 /** One review, start to end. Returns the exit code; never calls process.exit itself (the tests drive it). */
@@ -379,15 +387,17 @@ export async function run({ argv, env, cwd, out = (s) => process.stdout.write(s 
     try { root = realpathSync(execGit(cwd, ["rev-parse", "--show-toplevel"]).toString().trim()); }
     catch { throw new Refusal("this folder is not inside a git repository"); }
     const gitBuf = (...a) => execGit(root, a), git = (...a) => gitBuf(...a).toString();
-    const change = selectChange(opts, env, git, () => snapshotTree(git, (extra, ...a) => execGit(root, a, extra).toString(), root));
-    if (!change.diff.trim()) { out(`Nothing to review: no changes against ${change.base}.`); return 0; }
-    read = fileReader(change, gitBuf);
     let args;
     if (opts.deep) {
       // The service fetches the repository and the diff itself: only where to find them goes up.
-      args = { deep: true, meta: { ...ciMeta(env, git), ...deepTarget(env, git, change.base) } };
-      log(`deep hunt of ${args.meta.repo} at ${args.meta.ref.slice(0, 12)} against ${args.meta.base_branch}`);
+      read = () => null;
+      args = { deep: true, meta: { ...ciMeta(env, git), ...deepTarget(opts, env, git) } };
+      log(`deep hunt of ${args.meta.repo} at ${args.meta.ref.slice(0, 12)} against ${args.meta.base_branch}; waiting up to ${timeoutS}s`);
+      if (timeoutS < 3600) log("a deep hunt takes about an hour: OHMYBUG_TIMEOUT_S under 3600 may end the wait before the result");
     } else {
+      const change = selectChange(opts, env, git, () => snapshotTree(git, (extra, ...a) => execGit(root, a, extra).toString(), root));
+      if (!change.diff.trim()) { out(`Nothing to review: no changes against ${change.base}.`); return 0; }
+      read = fileReader(change, gitBuf);
       const diff = trimDiff(change.diff, log);
       // The reviewers can ask for any file by path; without the list they cannot name a caller to ask for.
       let listing = change.all.join("\n");
