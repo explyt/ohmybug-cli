@@ -9,8 +9,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ciMeta, exitCodeFor, fitBody, parseArgs, resolveBase, rpcMessage, run, trimDiff, VERSION } from "../ohmybug.mjs";
 
-// The tests own their git config: a developer's global one (a git-lfs filter, say) would change what they see.
+// The tests own their git config: a developer's or a runner's own (a git-lfs filter, say) would change what they see.
 process.env.GIT_CONFIG_GLOBAL = "/dev/null";
+process.env.GIT_CONFIG_NOSYSTEM = "1";
 
 function repo() {
   const dir = mkdtempSync(join(tmpdir(), "ohmybug-cli-"));
@@ -45,8 +46,9 @@ function repo() {
 async function server({ findings = [], status = "done", review_of_record = true, httpStatus = 200, requested, requestedAgain, sse = false, submitStatus, toolError, faults = {}, filesStatus = 200, filesUrl, filesLocation, snapshotStatus = 200, snapshotLocation, uploadUrl, startStatus = 200 } = {}, port = 0) {
   const calls = [], posted = [], snapshots = [], events = [];
   let ticketArgs;
-  let url, asks = 0;
+  let url, asks = 0, requests = 0;
   const srv = createServer((req, res) => {
+    requests++;
     const chunks = [];
     req.on("data", (c) => chunks.push(c));
     req.on("end", () => {
@@ -112,7 +114,7 @@ async function server({ findings = [], status = "done", review_of_record = true,
   srv.keepAliveTimeout = 60_000;
   await new Promise((r) => srv.listen(port, "127.0.0.1", r));
   url = `http://127.0.0.1:${srv.address().port}`;
-  return { url, calls, posted, snapshots, events, get ticketArgs() { return ticketArgs }, close: () => new Promise((r) => { srv.close(r); srv.closeIdleConnections?.(); }) };
+  return { url, calls, posted, snapshots, events, get ticketArgs() { return ticketArgs }, get requests() { return requests }, close: () => new Promise((r) => { srv.close(r); srv.closeIdleConnections?.(); }) };
 }
 
 async function cli(dir, argv, env) {
@@ -665,15 +667,18 @@ test("the reviewed tree goes up as a snapshot before the payload; --no-snapshot 
   const { dir, git } = repo();
   writeFileSync(join(dir, "huge.bin.txt"), "h".repeat(1100 * 1024) + "\n");
   writeFileSync(join(dir, "data.txt"), "d".repeat(1100 * 1024) + "\n");
-  // An LFS file goes as its pointer: a smudge would fetch objects the size check never saw. Its attribute comes in a
-  // later commit, so adding it runs no clean filter.
+  // Files go as stored, whatever smudge is configured: an LFS pointer stays a pointer, and a file a filter keeps
+  // encrypted stays encrypted. The drivers come after the commit, so adding the files runs no clean filter.
   writeFileSync(join(dir, "media.lfs"), "pointer\n");
+  writeFileSync(join(dir, "keys.sec"), "ciphertext\n");
+  writeFileSync(join(dir, ".gitattributes"), "*.lfs filter=lfs\n*.sec filter=crypt\n");
   git("add", ".");
   git("commit", "-qm", "huge");
-  writeFileSync(join(dir, ".gitattributes"), "*.lfs filter=lfs\n");
-  git("-c", "filter.lfs.clean=cat", "add", ".gitattributes");
-  git("commit", "-qm", "lfs");
-  git("config", "filter.lfs.smudge", "sed s/^/SMUDGED-/");
+  for (const [d, mark] of [["lfs", "SMUDGED"], ["crypt", "PLAIN"]]) {
+    git("config", `filter.${d}.clean`, "cat");
+    git("config", `filter.${d}.smudge`, `sed s/^/${mark}-/`);
+    git("config", `filter.${d}.required`, "true");
+  }
   git("update-ref", "refs/remotes/origin/main", "HEAD");
   writeFileSync(join(dir, "app.js"), "export const a = 26\n");
   writeFileSync(join(dir, "data.txt"), "e".repeat(1100 * 1024) + "\n");
@@ -699,6 +704,7 @@ test("the reviewed tree goes up as a snapshot before the payload; --no-snapshot 
     assert.equal(existsSync(join(dirOut, "huge.bin.txt")), false);
     assert.equal(readFileSync(join(dirOut, "data.txt"), "utf8").length, 1100 * 1024 + 1);
     assert.equal(readFileSync(join(dirOut, "media.lfs"), "utf8"), "pointer\n");
+    assert.equal(readFileSync(join(dirOut, "keys.sec"), "utf8"), "ciphertext\n");
   } finally { await s.close() }
   const plain = await server();
   try {
@@ -749,13 +755,15 @@ test("snapshot guards: a ticket on another host sends nothing; a redirected or d
     const r = await cli(dir, [], { OHMYBUG_URL: foreign.url });
     assert.equal(r.code, 2);
     assert.match(r.log, /upload ticket named another host/);
-    assert.equal(other.snapshots.length + other.events.length, 0);
+    assert.equal(other.requests, 0);
   } finally { await foreign.close() }
   const moved = await server({ snapshotStatus: 307, snapshotLocation: `${other.url}/up/rev_test/repo`, findings: [high] });
   try {
     const r = await cli(dir, [], { OHMYBUG_URL: moved.url });
     assert.equal(r.code, 1);
-    assert.equal(other.snapshots.length, 0);
+    // Not followed: the snapshot fails and nothing reaches the other host.
+    assert.match(r.log, /snapshot did not go through/);
+    assert.equal(other.requests, 0);
   } finally { await moved.close(); await other.close() }
   const dropped = await server({ snapshotStatus: "reset", findings: [high] });
   try {
@@ -771,12 +779,14 @@ test("snapshot guards: a ticket on another host sends nothing; a redirected or d
     assert.match(r.log, /A hunt may have started/);
     assert.match(r.log, /review rev_test may still be running/);
   } finally { await broken.close() }
-  // A start post the service turned away before taking it started nothing, and the run says only that.
-  const busy = await server({ startStatus: 429 });
-  try {
-    const r = await cli(dir, [], { OHMYBUG_URL: busy.url });
-    assert.equal(r.code, 2);
-    assert.match(r.log, /nothing was started/);
-    assert.doesNotMatch(r.log, /may still be running/);
-  } finally { await busy.close() }
+  // A start post the service turned away started nothing, and the run does not say a hunt may be running.
+  for (const startStatus of [429, 410]) {
+    const away = await server({ startStatus });
+    try {
+      const r = await cli(dir, [], { OHMYBUG_URL: away.url });
+      assert.equal(r.code, 2);
+      assert.match(r.log, startStatus === 429 ? /nothing was started/ : /HTTP 410/);
+      assert.doesNotMatch(r.log, /may still be running/);
+    } finally { await away.close() }
+  }
 });

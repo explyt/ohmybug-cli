@@ -107,19 +107,24 @@ export function selectChange(opts, env, git, snapshot) {
 }
 
 /**
- * The reviewed tree as a tar.gz, without the blobs over SNAPSHOT_MAX_FILE the diff does not touch. git-lfs files go as
- * their pointers: the smudge would fetch every large object the size check never saw.
+ * The reviewed tree as a tar.gz, without the blobs over SNAPSHOT_MAX_FILE the diff does not touch. Files go as stored:
+ * every configured filter driver is off, as a smudge may decrypt secrets (git-crypt) or fetch every large object the
+ * size check never saw (git-lfs, whose files go as their pointers). A driver that is not configured never runs.
  */
-function snapshotArchive(change, git, gitBuf) {
+function snapshotArchive(change, gitBuf) {
   const touched = new Set(change.changed), big = [];
-  for (const rec of git("ls-tree", "-r", "-l", "-z", change.rev).split("\0")) {
+  let drivers = "";
+  try { drivers = gitBuf("config", "--name-only", "--get-regexp", "^filter\\.").toString(); } catch {} // none: exit 1
+  const off = [...new Set(drivers.split("\n").map((k) => k.match(/^filter\.(.+)\.[^.]+$/)?.[1]).filter(Boolean))]
+    .flatMap((d) => ["-c", `filter.${d}.smudge=`, "-c", `filter.${d}.process=`, "-c", `filter.${d}.required=false`]);
+  for (const rec of gitBuf("ls-tree", "-r", "-l", "-z", change.rev).toString().split("\0")) {
     const tab = rec.indexOf("\t");
     if (tab < 0) continue;
     const size = Number(rec.slice(0, tab).trim().split(/\s+/)[3]); // "-" for a submodule: NaN, kept
     if (size > SNAPSHOT_MAX_FILE && !touched.has(rec.slice(tab + 1))) big.push(rec.slice(tab + 1));
   }
   // shortcut: one argv pathspec per left-out file; fine for hundreds, tens of thousands of big blobs would hit ARG_MAX.
-  return gitBuf("-c", "core.autocrlf=false", "-c", "filter.lfs.smudge=", "-c", "filter.lfs.process=", "-c", "filter.lfs.required=false", "archive", "--format=tar.gz", change.rev, ...(big.length ? ["--", ".", ...big.map((p) => `:(exclude,literal)${p}`)] : []));
+  return gitBuf("-c", "core.autocrlf=false", ...off, "archive", "--format=tar.gz", change.rev, ...(big.length ? ["--", ".", ...big.map((p) => `:(exclude,literal)${p}`)] : []));
 }
 
 /**
@@ -289,9 +294,11 @@ export async function run({ argv, env, cwd, out = (s) => process.stdout.write(s 
         reached = true;
         const text = await res.text();
         if (res.ok) return text;
-        if (res.status === 401 || res.status === 403) throw new Refusal(`the API key was refused, or the request blocked (HTTP ${res.status} ${text.slice(0, 200)})`);
+        // A 4xx is the service turning the request away: a hunt it would have started was not.
+        const refuse = (m) => (once && res.status < 500 ? notSent(m) : new Refusal(m));
+        if (res.status === 401 || res.status === 403) throw refuse(`the API key was refused, or the request blocked (HTTP ${res.status} ${text.slice(0, 200)})`);
         const retryable = res.status === 429 || (!once && (res.status === 408 || res.status >= 500));
-        if (!retryable) throw new Refusal(`HTTP ${res.status} ${text.slice(0, 300)}${once && res.status >= 500 ? `. ${MAYBE_STARTED}` : ""}`);
+        if (!retryable) throw refuse(`HTTP ${res.status} ${text.slice(0, 300)}${once && res.status >= 500 ? `. ${MAYBE_STARTED}` : ""}`);
         why = `HTTP ${res.status}`;
         const after = res.headers.get("retry-after");
         retryAfter = Math.max(0, Number(after) * 1000 || Date.parse(after) - Date.now() || 0);
@@ -384,7 +391,7 @@ export async function run({ argv, env, cwd, out = (s) => process.stdout.write(s 
    * hunt runs on the diff and files alone. Building and sending it share one budget, SNAPSHOT_MAX_MS and at most half
    * the time left: the post that starts the hunt, and its polls, need the rest.
    */
-  async function submitWithSnapshot({ meta, ...payload }, change, git, gitTimed) {
+  async function submitWithSnapshot({ meta, ...payload }, change, gitTimed) {
     const t = await tool("submit_review", { upload: true, ...(meta ? { meta } : {}) });
     if (!t.review_id || !t.upload_url) throw new Refusal(`submit_review gave no upload ticket: ${JSON.stringify(t).slice(0, 300)}`);
     let up;
@@ -393,7 +400,7 @@ export async function run({ argv, env, cwd, out = (s) => process.stdout.write(s 
     const alone = "the hunt runs on the diff and files alone";
     const until = Date.now() + Math.min(SNAPSHOT_MAX_MS, Math.floor((deadline - Date.now() - POLL_ROOM) / 2));
     try {
-      const tgz = snapshotArchive(change, git, (...a) => gitTimed(Math.max(1, until - Date.now()), ...a));
+      const tgz = snapshotArchive(change, (...a) => gitTimed(Math.max(1, until - Date.now()), ...a));
       if (tgz.length > MAX_SNAPSHOT) log(`the repository snapshot is ${tgz.length} bytes, over ${MAX_SNAPSHOT}: ${alone}`);
       else {
         const repoUrl = new URL(up);
@@ -439,7 +446,7 @@ export async function run({ argv, env, cwd, out = (s) => process.stdout.write(s 
     const args = fitBody({ diff, files: [tree, ...pack(read, contextPaths(change.changed, change.all, git, change.rev), MAX_FILES - 1, MAX_BYTES - Buffer.byteLength(diff) - Buffer.byteLength(tree.content))], ...(Object.keys(meta).length ? { meta } : {}) });
     log(`reviewing ${change.changed.length} changed file(s) against ${change.base}`);
 
-    const sub = opts.snapshot ? await submitWithSnapshot(args, change, git, (ms, ...a) => execGit(root, a, undefined, ms)) : await tool("submit_review", args, true);
+    const sub = opts.snapshot ? await submitWithSnapshot(args, change, (ms, ...a) => execGit(root, a, undefined, ms)) : await tool("submit_review", args, true);
     if (!sub.review_id) throw new Refusal(`submit_review answered without a review id: ${JSON.stringify(sub).slice(0, 300)}. ${MAYBE_STARTED}`);
     started = sub;
     log(`review ${sub.review_id} started${sub.recent_median_minutes ? `; recent ones took about ${sub.recent_median_minutes} min` : ""}`);
