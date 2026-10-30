@@ -14,7 +14,8 @@ const USAGE = `ohmybug ${VERSION}: review this repository's changes with OhMyBug
 Usage:
   ohmybug [--base <ref>]     review <base>...HEAD (the committed changes of this branch)
   ohmybug --uncommitted      review the working tree against HEAD, untracked files included
-  --no-snapshot              send only the diff and related files, not the reviewed tree (a slower, weaker hunt)
+  ohmybug ... --no-snapshot  either mode without the repository snapshot: the diff and related files only
+                             (a slower hunt on less context)
 
 The base is --base, else $CI_MERGE_REQUEST_TARGET_BRANCH_NAME (GitLab merge request pipelines),
 else origin/main.
@@ -374,30 +375,36 @@ export async function run({ argv, env, cwd, out = (s) => process.stdout.write(s 
   /**
    * The hunt with the reviewed tree as its repository (input/repo), as the service's fast pair needs: an upload
    * ticket, the tree as a tar.gz, then {diff, files}, which starts the hunt. Nothing starts before that last post,
-   * so a refused or failed snapshot only means the hunt runs on the diff and files alone.
+   * so the ticket is retried like a poll, and a snapshot that cannot be built, is refused or fails only means the
+   * hunt runs on the diff and files alone.
    */
   async function submitWithSnapshot({ meta, ...payload }, change, git, gitBuf) {
-    const t = await tool("submit_review", { upload: true, ...(meta ? { meta } : {}) }, true);
+    const t = await tool("submit_review", { upload: true, ...(meta ? { meta } : {}) });
     if (!t.review_id || !t.upload_url) throw new Refusal(`submit_review gave no upload ticket: ${JSON.stringify(t).slice(0, 300)}`);
     let up;
     try { up = new URL(t.upload_url, api); } catch { throw new Refusal("the upload ticket named no usable address; nothing was sent"); }
     if (up.origin !== apiUrl.origin) throw new Refusal(`the upload ticket named another host (${up.host}); nothing was sent`);
-    const tgz = snapshotArchive(change, git, gitBuf);
-    if (tgz.length > MAX_SNAPSHOT) log(`the repository snapshot is ${tgz.length} bytes, over ${MAX_SNAPSHOT}: the hunt runs on the diff and files alone`);
-    else {
-      try {
-        const res = await fetch(`${up.href}/repo`, {
+    const alone = "the hunt runs on the diff and files alone";
+    try {
+      const tgz = snapshotArchive(change, git, gitBuf);
+      if (tgz.length > MAX_SNAPSHOT) log(`the repository snapshot is ${tgz.length} bytes, over ${MAX_SNAPSHOT}: ${alone}`);
+      else {
+        const repoUrl = new URL(up);
+        repoUrl.pathname = `${repoUrl.pathname.replace(/\/$/, "")}/repo`;
+        // Half the time left at most: the post that starts the hunt, and its polls, need the rest.
+        const res = await fetch(repoUrl, {
           method: "POST", headers: { "content-type": "application/gzip" }, body: tgz, redirect: "error",
-          signal: AbortSignal.timeout(Math.max(1, deadline - Date.now() - POLL_ROOM)),
+          signal: AbortSignal.timeout(Math.max(1, Math.floor((deadline - Date.now() - POLL_ROOM) / 2))),
         });
         if (res.ok) log(`repository snapshot sent (${tgz.length} bytes)`);
-        else log(`the repository snapshot was refused (HTTP ${res.status}): the hunt runs on the diff and files alone`);
-      } catch (e) { log(`the repository snapshot did not go through (${e.cause?.code ?? e.message}): the hunt runs on the diff and files alone`); }
-    }
+        else log(`the repository snapshot was refused (HTTP ${res.status}): ${alone}`);
+      }
+    } catch (e) { log(`the repository snapshot did not go through (${e.cause?.code ?? e.cause?.message ?? e.message}): ${alone}`); }
+    started = t;
     const text = await http(up.href, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(payload) }, { once: true });
     let r = {};
     try { r = JSON.parse(text) } catch {}
-    return { ...r, ...t };
+    return { ...t, ...r, review_id: t.review_id };
   }
 
   let started, read;
