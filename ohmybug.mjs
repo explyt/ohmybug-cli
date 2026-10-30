@@ -14,14 +14,16 @@ const USAGE = `ohmybug ${VERSION}: review this repository's changes with OhMyBug
 Usage:
   ohmybug [--base <ref>]     review <base>...HEAD (the committed changes of this branch)
   ohmybug --uncommitted      review the working tree against HEAD, untracked files included
+  ohmybug --deep [--base <branch>]  the deep hunt of the pushed HEAD commit (GitHub only): the service reads the
+                             whole repository; about an hour, so OHMYBUG_TIMEOUT_S defaults to 7200
 
 The base is --base, else $CI_MERGE_REQUEST_TARGET_BRANCH_NAME (GitLab merge request pipelines),
-else origin/main.
+else origin/main. With --deep it is a branch name: --base, else $GITHUB_BASE_REF, else main.
 
 Environment:
   OHMYBUG_API_KEY     required: a key from https://ohmybug.ai/me
   OHMYBUG_URL         default https://mcp.ohmybug.ai
-  OHMYBUG_TIMEOUT_S   how long to wait for the review, 30 to 86400 seconds, default 1800
+  OHMYBUG_TIMEOUT_S   how long to wait for the review, 30 to 86400 seconds, default 1800 (7200 with --deep)
 
 Behind a proxy: Node's fetch reads HTTPS_PROXY only with NODE_USE_ENV_PROXY=1 (Node 22.21+, 24+).
 
@@ -48,10 +50,11 @@ export class Deadline extends Error {}
 
 /** argv → options, or a string to print and exit 2 on. */
 export function parseArgs(argv) {
-  const o = { base: undefined, uncommitted: false, help: false, version: false };
+  const o = { base: undefined, uncommitted: false, deep: false, help: false, version: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--uncommitted") o.uncommitted = true;
+    else if (a === "--deep") o.deep = true;
     else if (a === "--help" || a === "-h") o.help = true;
     else if (a === "--version") o.version = true;
     else if (a === "--base") { if (!argv[i + 1] || argv[i + 1].startsWith("-")) return "--base needs a ref"; o.base = argv[++i]; }
@@ -59,6 +62,7 @@ export function parseArgs(argv) {
     else return `unknown argument: ${a}`;
   }
   if (o.uncommitted && o.base) return "--uncommitted and --base do not go together";
+  if (o.uncommitted && o.deep) return "--deep reviews a pushed commit, not the working tree: commit, push and run ohmybug --deep";
   return o;
 }
 
@@ -183,7 +187,7 @@ function contextPaths(changed, all, git, rev) {
   return [...changed, ...roots, ...[...hits].sort((a, b) => b[1] - a[1]).map(([p]) => p)];
 }
 
-/** What the CI says about the change, as the server's optional labels; never repo or ref, so the server reads no host. */
+/** What the CI says about the change, as the server's optional labels; never repo or ref, so the server reads no host (only --deep adds them, deepTarget). */
 export function ciMeta(env, git) {
   const cut = (v, n) => (typeof v === "string" ? v.slice(0, n).trim() : "");
   let branch = cut(env.CI_MERGE_REQUEST_SOURCE_BRANCH_NAME || env.CI_COMMIT_REF_NAME || env.BITBUCKET_BRANCH, 200);
@@ -225,6 +229,27 @@ export function rpcMessage(text) {
   throw new Refusal(`unreadable answer: ${text.slice(0, 200)}`);
 }
 
+/**
+ * Where the deep hunt finds the change, read from git and the environment only (no local diff: a shallow CI clone
+ * has no base): the github.com repository (the origin remote, which is the checkout's own, else GITHUB_REPOSITORY),
+ * the pushed HEAD commit and the base branch. The service reads a public repository, or one with the OhMyBug App installed.
+ */
+export function deepTarget(opts, env, git) {
+  const server = env.GITHUB_SERVER_URL;
+  if (server && !/^https:\/\/github\.com\/?$/.test(server)) throw new Refusal(`--deep reads repositories on github.com, not on ${server}`);
+  let url = "";
+  try { url = git("remote", "get-url", "origin").trim(); } catch {}
+  let repo = url.match(/^(?:[\w.+-]+:\/\/)?(?:[^@/]+@)?github\.com[:/]([\w.-]+\/[\w.-]+?)(?:\.git)?\/?$/)?.[1] ?? "";
+  if (!repo && /^[\w.-]+\/[\w.-]+$/.test(env.GITHUB_REPOSITORY ?? "")) repo = env.GITHUB_REPOSITORY;
+  if (!repo) throw new Refusal("--deep needs a GitHub repository: an origin remote on github.com, or GITHUB_REPOSITORY=owner/name");
+  const ref = git("rev-parse", "HEAD").trim();
+  // In Actions the checked-out commit GITHUB_SHA is GitHub's own; any other HEAD must be on an origin branch.
+  if (ref !== env.GITHUB_SHA && !git("branch", "-r", "--list", "origin/*", "--contains", ref).trim()) throw new Refusal("--deep reviews a pushed commit: no remote branch holds HEAD; push it first");
+  const base = (opts.base || env.GITHUB_BASE_REF || "main").replace(/^(refs\/remotes\/)?origin\//, "");
+  if (/^[0-9a-f]{7,40}$/i.test(base) || /[~^:\s]|\.\./.test(base)) throw new Refusal(`--deep needs the base as a branch name, not ${base}`);
+  return { repo, ref, base_branch: base };
+}
+
 /** One review, start to end. Returns the exit code; never calls process.exit itself (the tests drive it). */
 export async function run({ argv, env, cwd, out = (s) => process.stdout.write(s + "\n"), log = (s) => process.stderr.write(`ohmybug: ${s}\n`) }) {
   const opts = parseArgs(argv);
@@ -233,7 +258,7 @@ export async function run({ argv, env, cwd, out = (s) => process.stdout.write(s 
   if (opts.version) { out(VERSION); return 0; }
   if (!env.OHMYBUG_API_KEY) { log("OHMYBUG_API_KEY is not set: create a key at https://ohmybug.ai/me"); return 2; }
   // Under 30 s no poll fits before the deadline: refused before a paid hunt starts.
-  const timeoutS = Number(env.OHMYBUG_TIMEOUT_S || 1800);
+  const timeoutS = Number(env.OHMYBUG_TIMEOUT_S || (opts.deep ? 7200 : 1800));
   if (!Number.isInteger(timeoutS) || timeoutS < 30 || timeoutS > 86400) { log(`OHMYBUG_TIMEOUT_S must be whole seconds from 30 to 86400, not ${env.OHMYBUG_TIMEOUT_S}`); return 2; }
   const api = (env.OHMYBUG_URL || "https://mcp.ohmybug.ai").replace(/\/$/, "");
   // The key and the code travel in this request: https, or plain http to this machine only (a local test server).
@@ -360,25 +385,34 @@ export async function run({ argv, env, cwd, out = (s) => process.stdout.write(s 
     try { root = realpathSync(execGit(cwd, ["rev-parse", "--show-toplevel"]).toString().trim()); }
     catch { throw new Refusal("this folder is not inside a git repository"); }
     const gitBuf = (...a) => execGit(root, a), git = (...a) => gitBuf(...a).toString();
-    const change = selectChange(opts, env, git, () => snapshotTree(git, (extra, ...a) => execGit(root, a, extra).toString(), root));
-    if (!change.diff.trim()) { out(`Nothing to review: no changes against ${change.base}.`); return 0; }
-    const diff = trimDiff(change.diff, log);
-    read = fileReader(change, gitBuf);
-    // The reviewers can ask for any file by path; without the list they cannot name a caller to ask for.
-    let listing = change.all.join("\n");
-    if (Buffer.byteLength(listing) > MAX_TREE) {
-      listing = Buffer.from(listing).subarray(0, MAX_TREE).toString();
-      listing = `${listing.slice(0, listing.lastIndexOf("\n"))}\n# (list cut at ${MAX_TREE} bytes)`;
+    let args;
+    if (opts.deep) {
+      // The service fetches the repository and the diff itself: only where to find them goes up.
+      read = () => null;
+      args = { deep: true, meta: { ...ciMeta(env, git), ...deepTarget(opts, env, git) } };
+      log(`deep hunt of ${args.meta.repo} at ${args.meta.ref.slice(0, 12)} against ${args.meta.base_branch}; waiting up to ${timeoutS}s`);
+      if (timeoutS < 3600) log("a deep hunt takes about an hour: OHMYBUG_TIMEOUT_S under 3600 may end the wait before the result");
+    } else {
+      const change = selectChange(opts, env, git, () => snapshotTree(git, (extra, ...a) => execGit(root, a, extra).toString(), root));
+      if (!change.diff.trim()) { out(`Nothing to review: no changes against ${change.base}.`); return 0; }
+      read = fileReader(change, gitBuf);
+      const diff = trimDiff(change.diff, log);
+      // The reviewers can ask for any file by path; without the list they cannot name a caller to ask for.
+      let listing = change.all.join("\n");
+      if (Buffer.byteLength(listing) > MAX_TREE) {
+        listing = Buffer.from(listing).subarray(0, MAX_TREE).toString();
+        listing = `${listing.slice(0, listing.lastIndexOf("\n"))}\n# (list cut at ${MAX_TREE} bytes)`;
+      }
+      const tree = { path: ".review-client/tree.txt", content: `# Every file path in this repository at the reviewed head, one per line. Sent by the review client; request any of them.\n${listing}\n` };
+      // Raw and escaped: a quote- or tab-heavy diff can pass the first and not the second. fitBody never drops the
+      // listing, so the diff and the listing together, escaped, leave room for meta (8 KB at most).
+      if (Buffer.byteLength(diff) > MAX_BYTES || Buffer.byteLength(JSON.stringify(diff)) + Buffer.byteLength(JSON.stringify(tree.content)) > MAX_BODY - 64 * 1024) {
+        throw new Refusal(`the diff (${Buffer.byteLength(diff)} bytes) and the file list are over what the service takes once encoded: ${opts.uncommitted ? "commit part of it and review" : "review"} a smaller range with --base`);
+      }
+      const meta = ciMeta(env, git);
+      args = fitBody({ diff, files: [tree, ...pack(read, contextPaths(change.changed, change.all, git, change.rev), MAX_FILES - 1, MAX_BYTES - Buffer.byteLength(diff) - Buffer.byteLength(tree.content))], ...(Object.keys(meta).length ? { meta } : {}) });
+      log(`reviewing ${change.changed.length} changed file(s) against ${change.base}`);
     }
-    const tree = { path: ".review-client/tree.txt", content: `# Every file path in this repository at the reviewed head, one per line. Sent by the review client; request any of them.\n${listing}\n` };
-    // Raw and escaped: a quote- or tab-heavy diff can pass the first and not the second. fitBody never drops the
-    // listing, so the diff and the listing together, escaped, leave room for meta (8 KB at most).
-    if (Buffer.byteLength(diff) > MAX_BYTES || Buffer.byteLength(JSON.stringify(diff)) + Buffer.byteLength(JSON.stringify(tree.content)) > MAX_BODY - 64 * 1024) {
-      throw new Refusal(`the diff (${Buffer.byteLength(diff)} bytes) and the file list are over what the service takes once encoded: ${opts.uncommitted ? "commit part of it and review" : "review"} a smaller range with --base`);
-    }
-    const meta = ciMeta(env, git);
-    const args = fitBody({ diff, files: [tree, ...pack(read, contextPaths(change.changed, change.all, git, change.rev), MAX_FILES - 1, MAX_BYTES - Buffer.byteLength(diff) - Buffer.byteLength(tree.content))], ...(Object.keys(meta).length ? { meta } : {}) });
-    log(`reviewing ${change.changed.length} changed file(s) against ${change.base}`);
 
     const sub = await tool("submit_review", args, true);
     if (!sub.review_id) throw new Refusal(`submit_review answered without a review id: ${JSON.stringify(sub).slice(0, 300)}. ${MAYBE_STARTED}`);

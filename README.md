@@ -26,6 +26,7 @@ Create an API key at [ohmybug.ai/me](https://ohmybug.ai/me) and put it in `OHMYB
 ohmybug                  # review <base>...HEAD: the commits of this branch
 ohmybug --base develop   # the same against another base
 ohmybug --uncommitted    # review the working tree against HEAD, untracked files included (not ignored ones)
+ohmybug --deep           # the deep hunt of the pushed HEAD (GitHub, public or with the OhMyBug App): the service reads the whole repository; about an hour
 ```
 
 The base is `--base`, else `$CI_MERGE_REQUEST_TARGET_BRANCH_NAME` (GitLab merge request pipelines), else `origin/main`. The CI clone must contain the base: fetch it, or clone with enough depth.
@@ -41,7 +42,7 @@ The CLI prints each finding (severity, file:line, title, failure scenario) and a
 | Variable | Default | |
 |---|---|---|
 | `OHMYBUG_API_KEY` | required | your key |
-| `OHMYBUG_TIMEOUT_S` | `1800` | how long to wait for the review, 30 to 86400 seconds |
+| `OHMYBUG_TIMEOUT_S` | `1800` (`7200` with `--deep`) | how long to wait for the review, 30 to 86400 seconds |
 | `OHMYBUG_URL` | `https://mcp.ohmybug.ai` | the service |
 
 ## Billing
@@ -84,6 +85,8 @@ pipelines:
 ```
 
 ## What is sent
+
+With `--deep`, no code is sent: only the GitHub repository name (from the origin remote, else `$GITHUB_REPOSITORY`), the HEAD commit, the base branch and the branch name; the service reads the repository from GitHub (public, or with the OhMyBug App installed).
 
 The diff (when it is over 2 MiB, per-file entries over 160 KiB, such as lockfiles and generated files, are left out and the run says so), the list of file paths at the reviewed head, and up to 29 related files (the changed files, the project manifests, and files that mention a changed module). During the review the reviewers may ask for more files by path. Every file sent is read from the reviewed commit; with `--uncommitted`, from a snapshot of the working tree taken at the start (untracked files included, nested repositories left out), so edits made while the review runs do not reach it. Only files of the reviewed tree are sent: untracked ignored files, anything under `.git` and anything outside the repository never are (a file committed to the repository is part of it, ignored or not). File requests are answered only to the service's own address, and redirects are not followed. With the review go the branch name and, in a GitLab merge request pipeline, the merge request title and description.
 
