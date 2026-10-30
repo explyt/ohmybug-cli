@@ -1,6 +1,6 @@
 # ohmybug CLI
 
-Review the changes in a git repository with the [OhMyBug](https://ohmybug.ai) bug hunt from any CI system (GitLab CI, Bitbucket Pipelines, Jenkins) or from your shell. The repository can be hosted anywhere: the CLI sends the diff and a few related files itself.
+Review the changes in a git repository with the [OhMyBug](https://ohmybug.ai) bug hunt from any CI system (GitLab CI, Bitbucket Pipelines, Jenkins) or from your shell. The repository can be hosted anywhere: the CLI sends it itself, as a snapshot of the reviewed commit (see [What is sent](#what-is-sent)).
 
 One file, no dependencies, Node.js 18 or newer.
 
@@ -13,7 +13,7 @@ curl -fsSL https://raw.githubusercontent.com/explyt/ohmybug-cli/main/install.sh 
 Or download [`ohmybug.mjs`](ohmybug.mjs) and run it with `node ohmybug.mjs`. The installer takes the latest `main`; to pin a release in CI, name its file:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/explyt/ohmybug-cli/main/install.sh | OHMYBUG_CLI_URL=https://raw.githubusercontent.com/explyt/ohmybug-cli/v0.1.0/ohmybug.mjs sh
+curl -fsSL https://raw.githubusercontent.com/explyt/ohmybug-cli/main/install.sh | OHMYBUG_CLI_URL=https://raw.githubusercontent.com/explyt/ohmybug-cli/v0.2.0/ohmybug.mjs sh
 ```
 
 Behind a proxy: Node's `fetch` reads `HTTPS_PROXY` only with `NODE_USE_ENV_PROXY=1` (Node 22.21 or newer, or 24 or newer).
@@ -26,6 +26,7 @@ Create an API key at [ohmybug.ai/me](https://ohmybug.ai/me) and put it in `OHMYB
 ohmybug                  # review <base>...HEAD: the commits of this branch
 ohmybug --base develop   # the same against another base
 ohmybug --uncommitted    # review the working tree against HEAD, untracked files included (not ignored ones)
+ohmybug --no-snapshot    # send only the diff and related files, not the repository
 ```
 
 The base is `--base`, else `$CI_MERGE_REQUEST_TARGET_BRANCH_NAME` (GitLab merge request pipelines), else `origin/main`. The CI clone must contain the base: fetch it, or clone with enough depth.
@@ -60,7 +61,7 @@ ohmybug:
     GIT_DEPTH: 0
   script:
     - git fetch origin "$CI_MERGE_REQUEST_TARGET_BRANCH_NAME"
-    - curl -fsSL https://raw.githubusercontent.com/explyt/ohmybug-cli/v0.1.0/install.sh | OHMYBUG_CLI_URL=https://raw.githubusercontent.com/explyt/ohmybug-cli/v0.1.0/ohmybug.mjs sh
+    - curl -fsSL https://raw.githubusercontent.com/explyt/ohmybug-cli/v0.2.0/install.sh | OHMYBUG_CLI_URL=https://raw.githubusercontent.com/explyt/ohmybug-cli/v0.2.0/ohmybug.mjs sh
     - ohmybug
 ```
 
@@ -79,13 +80,13 @@ pipelines:
           script:
             # The clone tracks one branch: name where the target goes, or origin/<target> does not exist.
             - git fetch origin "+refs/heads/$BITBUCKET_PR_DESTINATION_BRANCH:refs/remotes/origin/$BITBUCKET_PR_DESTINATION_BRANCH"
-            - curl -fsSL https://raw.githubusercontent.com/explyt/ohmybug-cli/v0.1.0/install.sh | OHMYBUG_CLI_URL=https://raw.githubusercontent.com/explyt/ohmybug-cli/v0.1.0/ohmybug.mjs sh
+            - curl -fsSL https://raw.githubusercontent.com/explyt/ohmybug-cli/v0.2.0/install.sh | OHMYBUG_CLI_URL=https://raw.githubusercontent.com/explyt/ohmybug-cli/v0.2.0/ohmybug.mjs sh
             - ohmybug --base "origin/$BITBUCKET_PR_DESTINATION_BRANCH"
 ```
 
 ## What is sent
 
-The diff (when it is over 2 MiB, per-file entries over 160 KiB, such as lockfiles and generated files, are left out and the run says so), the list of file paths at the reviewed head, and up to 29 related files (the changed files, the project manifests, and files that mention a changed module). During the review the reviewers may ask for more files by path. Every file sent is read from the reviewed commit; with `--uncommitted`, from a snapshot of the working tree taken at the start (untracked files included, nested repositories left out), so edits made while the review runs do not reach it. Only files of the reviewed tree are sent: untracked ignored files, anything under `.git` and anything outside the repository never are (a file committed to the repository is part of it, ignored or not). File requests are answered only to the service's own address, and redirects are not followed. With the review go the branch name and, in a GitLab merge request pipeline, the merge request title and description.
+The repository at the reviewed commit, as an archive (`git archive` of the reviewed tree: files over 1 MiB the change does not touch, and paths marked `export-ignore`, are left out; files go as stored, with no smudge filter: git-lfs files as their pointers, files a filter such as git-crypt keeps encrypted as ciphertext). With `--uncommitted` it is the working-tree snapshot, untracked files included and ignored ones not. Building and sending it get 10 minutes at most, and half the time left; an archive over 128 MiB is not sent, and a snapshot that is refused, fails or runs out of that time leaves the hunt on the diff and files alone; `--no-snapshot` turns it off, for a slower hunt on less context. Then the diff (when it is over 2 MiB, per-file entries over 160 KiB, such as lockfiles and generated files, are left out and the run says so), the list of file paths at the reviewed head, and up to 29 related files (the changed files, the project manifests, and files that mention a changed module). During the review the reviewers may ask for more files by path. Every file sent is read from the reviewed commit; with `--uncommitted`, from a snapshot of the working tree taken at the start (untracked files included, nested repositories left out), so edits made while the review runs do not reach it. Only files of the reviewed tree are sent: untracked ignored files, anything under `.git` and anything outside the repository never are (a file committed to the repository is part of it, ignored or not). File requests are answered only to the service's own address, and redirects are not followed. With the review go the branch name and, in a GitLab merge request pipeline, the merge request title and description.
 
 ## Develop
 
