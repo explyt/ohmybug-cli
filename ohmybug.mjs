@@ -42,12 +42,14 @@ const POLL_ROOM = 20_000;
 const MAX_FILES = 30, MAX_EXTRA = 20, MAX_BYTES = 9 * 1024 * 1024, MAX_BODY = 11_500_000, MAX_FILE = 512 * 1024;
 const MAX_TREE = 1024 * 1024;
 // The repository snapshot: the server's ceiling, and the untouched blobs left out of it (media, recordings).
-const MAX_SNAPSHOT = 128 * 1024 * 1024, SNAPSHOT_MAX_FILE = 1024 * 1024;
+const MAX_SNAPSHOT = 128 * 1024 * 1024, SNAPSHOT_MAX_FILE = 1024 * 1024, SNAPSHOT_MAX_MS = 10 * 60_000;
 // Pinned diff format, whatever the user's git config says (noprefix, mnemonicPrefix, textconv drivers).
 const DIFF_FLAGS = ["--no-color", "--no-ext-diff", "--no-textconv", "--src-prefix=a/", "--dst-prefix=b/"];
 const TRANSIENT_TOOL = new Set(["internal", "rate_limited"]);
 
 export class Refusal extends Error {}
+/** A refusal of the post that starts the hunt, made before the service took it: no "may still be running". */
+const notSent = (message) => Object.assign(new Refusal(message), { notSent: true });
 export class Deadline extends Error {}
 
 /** argv → options, or a string to print and exit 2 on. */
@@ -104,7 +106,10 @@ export function selectChange(opts, env, git, snapshot) {
   return { diff, changed, all, rev, base };
 }
 
-/** The reviewed tree as a tar.gz, without the blobs over SNAPSHOT_MAX_FILE the diff does not touch. */
+/**
+ * The reviewed tree as a tar.gz, without the blobs over SNAPSHOT_MAX_FILE the diff does not touch. git-lfs files go as
+ * their pointers: the smudge would fetch every large object the size check never saw.
+ */
 function snapshotArchive(change, git, gitBuf) {
   const touched = new Set(change.changed), big = [];
   for (const rec of git("ls-tree", "-r", "-l", "-z", change.rev).split("\0")) {
@@ -114,7 +119,7 @@ function snapshotArchive(change, git, gitBuf) {
     if (size > SNAPSHOT_MAX_FILE && !touched.has(rec.slice(tab + 1))) big.push(rec.slice(tab + 1));
   }
   // shortcut: one argv pathspec per left-out file; fine for hundreds, tens of thousands of big blobs would hit ARG_MAX.
-  return gitBuf("-c", "core.autocrlf=false", "archive", "--format=tar.gz", change.rev, ...(big.length ? ["--", ".", ...big.map((p) => `:(exclude,literal)${p}`)] : []));
+  return gitBuf("-c", "core.autocrlf=false", "-c", "filter.lfs.smudge=", "-c", "filter.lfs.process=", "-c", "filter.lfs.required=false", "archive", "--format=tar.gz", change.rev, ...(big.length ? ["--", ".", ...big.map((p) => `:(exclude,literal)${p}`)] : []));
 }
 
 /**
@@ -263,7 +268,7 @@ export async function run({ argv, env, cwd, out = (s) => process.stdout.write(s 
   }
   const deadline = Date.now() + timeoutS * 1000;
   const sleep = (ms) => new Promise((r) => setTimeout(r, Math.max(0, Math.min(ms, deadline - Date.now()))));
-  const execGit = (dir, a, extra) => execFileSync("git", ["-C", dir, ...a], { maxBuffer: 256 * 1024 * 1024, stdio: ["ignore", "pipe", "pipe"], ...(extra ? { env: { ...process.env, ...extra } } : {}) });
+  const execGit = (dir, a, extra, timeout) => execFileSync("git", ["-C", dir, ...a], { maxBuffer: 256 * 1024 * 1024, stdio: ["ignore", "pipe", "pipe"], timeout, ...(extra ? { env: { ...process.env, ...extra } } : {}) });
 
   /**
    * POST and return the body text, retrying network errors, 408, 429 and 5xx until the deadline; a host never reached
@@ -277,7 +282,7 @@ export async function run({ argv, env, cwd, out = (s) => process.stdout.write(s 
     for (let attempt = 0; ; attempt++) {
       const left = deadline - Date.now();
       if (left <= 0) throw new Deadline("timed out");
-      if (once && left <= POLL_ROOM) throw new Refusal("too little of OHMYBUG_TIMEOUT_S is left to start a hunt and wait for it; nothing was started");
+      if (once && left <= POLL_ROOM) throw notSent("too little of OHMYBUG_TIMEOUT_S is left to start a hunt and wait for it; nothing was started");
       let why, retryAfter = 0;
       try {
         const res = await fetch(url, { ...init, redirect: "error", signal: AbortSignal.timeout(once ? left - POLL_ROOM : Math.min(60_000, left)) });
@@ -307,7 +312,7 @@ export async function run({ argv, env, cwd, out = (s) => process.stdout.write(s 
       const wait = Math.max(retryAfter, Math.min(30_000, 2000 * 2 ** attempt));
       // A wait the deadline cannot fit ends now, not after idling to the deadline.
       if (wait >= deadline - Date.now() - (once ? POLL_ROOM : 0)) {
-        if (once) throw new Refusal(`${why}: the service asks to wait ${Math.round(wait / 1000)}s, more than OHMYBUG_TIMEOUT_S leaves; nothing was started`);
+        if (once) throw notSent(`${why}: the service asks to wait ${Math.round(wait / 1000)}s, more than OHMYBUG_TIMEOUT_S leaves; nothing was started`);
         throw new Deadline("timed out");
       }
       log(`${why}; retrying in ${Math.round(wait / 1000)}s`);
@@ -376,25 +381,26 @@ export async function run({ argv, env, cwd, out = (s) => process.stdout.write(s 
    * The hunt with the reviewed tree as its repository (input/repo), as the service's fast pair needs: an upload
    * ticket, the tree as a tar.gz, then {diff, files}, which starts the hunt. Nothing starts before that last post,
    * so the ticket is retried like a poll, and a snapshot that cannot be built, is refused or fails only means the
-   * hunt runs on the diff and files alone.
+   * hunt runs on the diff and files alone. Building and sending it share one budget, SNAPSHOT_MAX_MS and at most half
+   * the time left: the post that starts the hunt, and its polls, need the rest.
    */
-  async function submitWithSnapshot({ meta, ...payload }, change, git, gitBuf) {
+  async function submitWithSnapshot({ meta, ...payload }, change, git, gitTimed) {
     const t = await tool("submit_review", { upload: true, ...(meta ? { meta } : {}) });
     if (!t.review_id || !t.upload_url) throw new Refusal(`submit_review gave no upload ticket: ${JSON.stringify(t).slice(0, 300)}`);
     let up;
     try { up = new URL(t.upload_url, api); } catch { throw new Refusal("the upload ticket named no usable address; nothing was sent"); }
     if (up.origin !== apiUrl.origin) throw new Refusal(`the upload ticket named another host (${up.host}); nothing was sent`);
     const alone = "the hunt runs on the diff and files alone";
+    const until = Date.now() + Math.min(SNAPSHOT_MAX_MS, Math.floor((deadline - Date.now() - POLL_ROOM) / 2));
     try {
-      const tgz = snapshotArchive(change, git, gitBuf);
+      const tgz = snapshotArchive(change, git, (...a) => gitTimed(Math.max(1, until - Date.now()), ...a));
       if (tgz.length > MAX_SNAPSHOT) log(`the repository snapshot is ${tgz.length} bytes, over ${MAX_SNAPSHOT}: ${alone}`);
       else {
         const repoUrl = new URL(up);
         repoUrl.pathname = `${repoUrl.pathname.replace(/\/$/, "")}/repo`;
-        // Half the time left at most: the post that starts the hunt, and its polls, need the rest.
         const res = await fetch(repoUrl, {
           method: "POST", headers: { "content-type": "application/gzip" }, body: tgz, redirect: "error",
-          signal: AbortSignal.timeout(Math.max(1, Math.floor((deadline - Date.now() - POLL_ROOM) / 2))),
+          signal: AbortSignal.timeout(Math.max(1, until - Date.now())),
         });
         if (res.ok) log(`repository snapshot sent (${tgz.length} bytes)`);
         else log(`the repository snapshot was refused (HTTP ${res.status}): ${alone}`);
@@ -433,7 +439,7 @@ export async function run({ argv, env, cwd, out = (s) => process.stdout.write(s 
     const args = fitBody({ diff, files: [tree, ...pack(read, contextPaths(change.changed, change.all, git, change.rev), MAX_FILES - 1, MAX_BYTES - Buffer.byteLength(diff) - Buffer.byteLength(tree.content))], ...(Object.keys(meta).length ? { meta } : {}) });
     log(`reviewing ${change.changed.length} changed file(s) against ${change.base}`);
 
-    const sub = opts.snapshot ? await submitWithSnapshot(args, change, git, gitBuf) : await tool("submit_review", args, true);
+    const sub = opts.snapshot ? await submitWithSnapshot(args, change, git, (ms, ...a) => execGit(root, a, undefined, ms)) : await tool("submit_review", args, true);
     if (!sub.review_id) throw new Refusal(`submit_review answered without a review id: ${JSON.stringify(sub).slice(0, 300)}. ${MAYBE_STARTED}`);
     started = sub;
     log(`review ${sub.review_id} started${sub.recent_median_minutes ? `; recent ones took about ${sub.recent_median_minutes} min` : ""}`);
@@ -473,7 +479,7 @@ export async function run({ argv, env, cwd, out = (s) => process.stdout.write(s 
     if (e instanceof Refusal) log(`could not review: ${e.message}`);
     else if (e instanceof Deadline) log(`could not review: no result within OHMYBUG_TIMEOUT_S (${timeoutS}s)`);
     else log(`could not review: ${e.message ?? e}`);
-    if (started) log(`review ${started.review_id} may still be running${started.live_url ? `: ${started.live_url}` : ""}`);
+    if (started && !e.notSent) log(`review ${started.review_id} may still be running${started.live_url ? `: ${started.live_url}` : ""}`);
     return 2;
   }
 }

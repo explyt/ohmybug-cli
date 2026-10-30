@@ -9,6 +9,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ciMeta, exitCodeFor, fitBody, parseArgs, resolveBase, rpcMessage, run, trimDiff, VERSION } from "../ohmybug.mjs";
 
+// The tests own their git config: a developer's global one (a git-lfs filter, say) would change what they see.
+process.env.GIT_CONFIG_GLOBAL = "/dev/null";
+
 function repo() {
   const dir = mkdtempSync(join(tmpdir(), "ohmybug-cli-"));
   const git = (...a) => execFileSync("git", ["-C", dir, ...a], { stdio: ["ignore", "pipe", "pipe"] }).toString();
@@ -51,6 +54,8 @@ async function server({ findings = [], status = "done", review_of_record = true,
       if (httpStatus !== 200) { res.writeHead(httpStatus); return res.end("no"); }
       if (req.url.startsWith("/up/rev_test/repo")) {
         if (snapshotStatus === "reset") return req.socket.destroy();
+        // The ticket's signature must come along, as the real service checks it.
+        if (!req.url.includes("sig=abc")) { res.writeHead(403); return res.end("unsigned"); }
         snapshots.push(Buffer.concat(chunks));
         events.push("snapshot");
         res.writeHead(snapshotStatus, snapshotLocation ? { location: snapshotLocation } : {});
@@ -58,7 +63,7 @@ async function server({ findings = [], status = "done", review_of_record = true,
       }
       if (req.url.startsWith("/up/rev_test")) {
         events.push("start");
-        if (startStatus !== 200) { res.writeHead(startStatus); return res.end("boom"); }
+        if (startStatus !== 200) { res.writeHead(startStatus, startStatus === 429 ? { "retry-after": "3600" } : {}); return res.end("boom"); }
         Object.assign(calls.find((c) => c.name === "submit_review").args, JSON.parse(body));
         res.writeHead(200, { "content-type": "application/json" });
         return res.end(JSON.stringify({ status: "running" }));
@@ -660,14 +665,22 @@ test("the reviewed tree goes up as a snapshot before the payload; --no-snapshot 
   const { dir, git } = repo();
   writeFileSync(join(dir, "huge.bin.txt"), "h".repeat(1100 * 1024) + "\n");
   writeFileSync(join(dir, "data.txt"), "d".repeat(1100 * 1024) + "\n");
+  // An LFS file goes as its pointer: a smudge would fetch objects the size check never saw. Its attribute comes in a
+  // later commit, so adding it runs no clean filter.
+  writeFileSync(join(dir, "media.lfs"), "pointer\n");
   git("add", ".");
   git("commit", "-qm", "huge");
+  writeFileSync(join(dir, ".gitattributes"), "*.lfs filter=lfs\n");
+  git("-c", "filter.lfs.clean=cat", "add", ".gitattributes");
+  git("commit", "-qm", "lfs");
+  git("config", "filter.lfs.smudge", "sed s/^/SMUDGED-/");
   git("update-ref", "refs/remotes/origin/main", "HEAD");
   writeFileSync(join(dir, "app.js"), "export const a = 26\n");
   writeFileSync(join(dir, "data.txt"), "e".repeat(1100 * 1024) + "\n");
   git("commit", "-qam", "c");
   writeFileSync(join(dir, "app.js"), "export const a = 27 // not committed, not in the snapshot\n");
-  const s = await server({ findings: [high] });
+  // Nothing starts before the last post, so a failed ticket is asked again.
+  const s = await server({ findings: [high], faults: { submit_review: 503 } });
   try {
     const r = await cli(dir, [], { OHMYBUG_URL: s.url });
     assert.equal(r.code, 1);
@@ -675,7 +688,7 @@ test("the reviewed tree goes up as a snapshot before the payload; --no-snapshot 
     assert.equal(submit.args.upload, true);
     // The ticket carries no payload; the snapshot goes up before the post that starts the hunt.
     assert.equal(s.ticketArgs.diff, undefined);
-    assert.deepEqual(s.events, ["ticket", "snapshot", "start"]);
+    assert.deepEqual(s.events, ["ticket", "ticket", "snapshot", "start"]);
     assert.match(submit.args.diff, /\+export const a = 26/);
     assert.equal(s.snapshots.length, 1);
     const dirOut = mkdtempSync(join(tmpdir(), "ohmybug-snap-"));
@@ -685,6 +698,7 @@ test("the reviewed tree goes up as a snapshot before the payload; --no-snapshot 
     // An untouched blob over 1 MiB stays out of the snapshot; a changed one stays in.
     assert.equal(existsSync(join(dirOut, "huge.bin.txt")), false);
     assert.equal(readFileSync(join(dirOut, "data.txt"), "utf8").length, 1100 * 1024 + 1);
+    assert.equal(readFileSync(join(dirOut, "media.lfs"), "utf8"), "pointer\n");
   } finally { await s.close() }
   const plain = await server();
   try {
@@ -707,8 +721,10 @@ test("a refused snapshot still starts the hunt on the diff and files", async () 
   } finally { await s.close() }
 });
 
-test("--uncommitted sends the working-tree snapshot, untracked files included", async () => {
+test("--uncommitted sends the working-tree snapshot, untracked files included and ignored ones not", async () => {
   const { dir } = repo();
+  writeFileSync(join(dir, ".gitignore"), "secret.env\n");
+  writeFileSync(join(dir, "secret.env"), "TOKEN=x\n");
   writeFileSync(join(dir, "app.js"), "export const a = 29 // in the working tree only\n");
   writeFileSync(join(dir, "new.js"), "export const n = 4\n");
   const s = await server();
@@ -719,6 +735,7 @@ test("--uncommitted sends the working-tree snapshot, untracked files included", 
     execFileSync("tar", ["-xzf", "s.tgz"], { cwd: out });
     assert.equal(readFileSync(join(out, "app.js"), "utf8"), "export const a = 29 // in the working tree only\n");
     assert.equal(readFileSync(join(out, "new.js"), "utf8"), "export const n = 4\n");
+    assert.equal(existsSync(join(out, "secret.env")), false);
   } finally { await s.close() }
 });
 
@@ -754,4 +771,12 @@ test("snapshot guards: a ticket on another host sends nothing; a redirected or d
     assert.match(r.log, /A hunt may have started/);
     assert.match(r.log, /review rev_test may still be running/);
   } finally { await broken.close() }
+  // A start post the service turned away before taking it started nothing, and the run says only that.
+  const busy = await server({ startStatus: 429 });
+  try {
+    const r = await cli(dir, [], { OHMYBUG_URL: busy.url });
+    assert.equal(r.code, 2);
+    assert.match(r.log, /nothing was started/);
+    assert.doesNotMatch(r.log, /may still be running/);
+  } finally { await busy.close() }
 });
