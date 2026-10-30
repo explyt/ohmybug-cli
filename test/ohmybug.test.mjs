@@ -9,6 +9,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ciMeta, exitCodeFor, fitBody, parseArgs, resolveBase, rpcMessage, run, trimDiff, VERSION } from "../ohmybug.mjs";
 
+// The tests own their git config: a developer's or a runner's own (a git-lfs filter, say) would change what they see.
+process.env.GIT_CONFIG_GLOBAL = "/dev/null";
+process.env.GIT_CONFIG_NOSYSTEM = "1";
+
 function repo() {
   const dir = mkdtempSync(join(tmpdir(), "ohmybug-cli-"));
   const git = (...a) => execFileSync("git", ["-C", dir, ...a], { stdio: ["ignore", "pipe", "pipe"] }).toString();
