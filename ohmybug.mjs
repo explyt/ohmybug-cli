@@ -21,7 +21,7 @@ The base is --base, else $CI_MERGE_REQUEST_TARGET_BRANCH_NAME (GitLab merge requ
 else origin/main. With --deep it is a branch name: --base, else $GITHUB_BASE_REF, else main.
 
 Environment:
-  OHMYBUG_API_KEY     required: a key from https://ohmybug.ai/me
+  OHMYBUG_API_KEY     required: a key from https://app.ohmybug.ai/me
   OHMYBUG_URL         default https://mcp.ohmybug.ai
   OHMYBUG_TIMEOUT_S   how long to wait for the review, 30 to 86400 seconds, default 1800 (7200 with --deep)
 
@@ -35,7 +35,7 @@ const RANK = { critical: 0, p0: 0, high: 1, p1: 1, medium: 2, p2: 2, low: 3, p3:
 const rankOf = (f) => RANK[String(f?.severity).toLowerCase()] ?? 4;
 // A gate fails closed: a severity it does not know blocks.
 const isBlocking = (f) => rankOf(f) !== 3;
-const MAYBE_STARTED = "A hunt may have started: see https://ohmybug.ai/me";
+const MAYBE_STARTED = "A hunt may have started: see https://app.ohmybug.ai/me";
 // Time kept after the paid call for at least one poll and get_findings.
 const POLL_ROOM = 20_000;
 // Server caps: 30 files and about 10 MiB of diff and files per call; 20 files per answer to a file request.
@@ -256,7 +256,7 @@ export async function run({ argv, env, cwd, out = (s) => process.stdout.write(s 
   if (typeof opts === "string") { log(opts); log("see ohmybug --help"); return 2; }
   if (opts.help) { out(USAGE); return 0; }
   if (opts.version) { out(VERSION); return 0; }
-  if (!env.OHMYBUG_API_KEY) { log("OHMYBUG_API_KEY is not set: create a key at https://ohmybug.ai/me"); return 2; }
+  if (!env.OHMYBUG_API_KEY) { log("OHMYBUG_API_KEY is not set: create a key at https://app.ohmybug.ai/me"); return 2; }
   // Under 30 s no poll fits before the deadline: refused before a paid hunt starts.
   const timeoutS = Number(env.OHMYBUG_TIMEOUT_S || (opts.deep ? 7200 : 1800));
   if (!Number.isInteger(timeoutS) || timeoutS < 30 || timeoutS > 86400) { log(`OHMYBUG_TIMEOUT_S must be whole seconds from 30 to 86400, not ${env.OHMYBUG_TIMEOUT_S}`); return 2; }

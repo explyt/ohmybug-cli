@@ -24,7 +24,7 @@ Behind a proxy: Node's `fetch` reads `HTTPS_PROXY` only with `NODE_USE_ENV_PROXY
 
 ## Use
 
-Create an API key at [ohmybug.ai/me](https://ohmybug.ai/me) and put it in `OHMYBUG_API_KEY`. Then, in the repository folder:
+Create an API key at [app.ohmybug.ai/me](https://app.ohmybug.ai/me) and put it in `OHMYBUG_API_KEY`. Then, in the repository folder:
 
 ```sh
 ohmybug                  # review <base>...HEAD: the commits of this branch
@@ -51,7 +51,7 @@ The CLI prints each finding (severity, file:line, title, failure scenario) and a
 
 ## Billing
 
-A key on **CI billing** (the key setting on [ohmybug.ai/me](https://ohmybug.ai/me)) pays per hunt with no confirm step: $4 for a fast hunt and $12 for a deep one ($24 on a wide change, one spread over 11 or more folder chunks), only when the result holds a medium or worse bug. A clean or failed hunt is free. The run prints what it was charged.
+A key on **CI billing** (the key setting on [app.ohmybug.ai/me](https://app.ohmybug.ai/me)) pays per hunt with no confirm step: $4 for a fast hunt and $12 for a deep one ($24 on a wide change, one spread over 11 or more folder chunks), only when the result holds a medium or worse bug. A clean or failed hunt is free. The run prints what it was charged.
 
 ## GitLab CI
 
