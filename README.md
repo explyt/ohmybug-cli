@@ -51,7 +51,7 @@ The CLI prints each finding (severity, file:line, title, failure scenario) and a
 
 ## Billing
 
-A key on **CI billing** (the key setting on [ohmybug.ai/me](https://ohmybug.ai/me)) pays per hunt with no confirm step: $2 for a fast hunt and $5 for a deep one ($10 on a large repository), only when the result holds a medium or worse bug. A clean or failed hunt is free. The run prints what it was charged.
+A key on **CI billing** (the key setting on [ohmybug.ai/me](https://ohmybug.ai/me)) pays per hunt with no confirm step: $4 for a fast hunt and $12 for a deep one ($24 on a wide change, one spread over 11 or more folder chunks), only when the result holds a medium or worse bug. A clean or failed hunt is free. The run prints what it was charged.
 
 ## GitLab CI
 
